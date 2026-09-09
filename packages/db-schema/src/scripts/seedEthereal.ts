@@ -112,13 +112,17 @@ async function main(): Promise<void> {
   }
 
   const accounts = await getAccounts(2);
+  // Port 2525 by default: Ethereal's alternate submission port. Render free
+  // services block outbound 25/465/587, so 2525 is the port that works there
+  // (override with SEED_SMTP_PORT when self-hosting elsewhere).
+  const smtpPort = parseInt(process.env.SEED_SMTP_PORT ?? "2525", 10);
   for (const acc of accounts) {
     await pool.query(
       `INSERT INTO senders (tenant_id, name, from_address, smtp_host, smtp_port, smtp_user, smtp_pass_encrypted, max_emails_per_hour)
-       VALUES ($1, $2, $3, 'smtp.ethereal.email', 587, $4, $5, $6)
+       VALUES ($1, $2, $3, 'smtp.ethereal.email', $7, $4, $5, $6)
        ON CONFLICT (tenant_id, from_address) DO UPDATE
          SET smtp_user = $4, smtp_pass_encrypted = $5, name = $2`,
-      [tenantId, acc.name, acc.user, acc.user, encryptSecret(acc.pass), 100],
+      [tenantId, acc.name, acc.user, acc.user, encryptSecret(acc.pass), 100, smtpPort],
     );
   }
 
