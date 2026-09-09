@@ -14,3 +14,6 @@ logs/
 .DS_Store
 .freebuff/
 .vercel
+
+# Render deploy orchestrator state (resource ids + generated secrets)
+.render-state.json

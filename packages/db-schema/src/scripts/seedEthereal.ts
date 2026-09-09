@@ -97,6 +97,20 @@ async function main(): Promise<void> {
   }
   const tenantId = tenant.rows[0].id;
 
+  // Deployments run this on every boot: if the tenant already has real
+  // Ethereal senders, keep them and skip provisioning entirely.
+  const existing = await pool.query<{ c: string }>(
+    `SELECT count(*)::text AS c FROM senders
+     WHERE tenant_id = $1 AND smtp_host = 'smtp.ethereal.email'
+       AND from_address NOT IN ('sender.one@ethereal.email', 'sender.two@ethereal.email')`,
+    [tenantId],
+  );
+  if (parseInt(existing.rows[0]?.c ?? "0", 10) >= 2) {
+    console.log(`[seed-ethereal] ${existing.rows[0].c} real Ethereal sender(s) already configured — nothing to do`);
+    await closePool();
+    return;
+  }
+
   const accounts = await getAccounts(2);
   for (const acc of accounts) {
     await pool.query(
