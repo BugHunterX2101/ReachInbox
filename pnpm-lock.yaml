@@ -31,6 +31,9 @@ importers:
       '@reachinbox/shared-types':
         specifier: workspace:*
         version: link:../../packages/shared-types
+      '@reachinbox/worker':
+        specifier: workspace:*
+        version: link:../worker
       connect-pg-simple:
         specifier: ^10.0.0
         version: 10.0.0

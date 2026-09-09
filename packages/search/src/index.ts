@@ -2,13 +2,36 @@ import { Client } from "@elastic/elasticsearch";
 
 export const EMAIL_JOBS_INDEX = "email_jobs";
 
+/**
+ * Single owner of the "is Elasticsearch available" policy. ES is a read
+ * optimization with a Postgres fallback (§7.3), so entire deployments can run
+ * without it (e.g. free tiers with no ES host): leave ELASTICSEARCH_URL unset
+ * (or set it to "disabled") and every surface degrades gracefully:
+ *   - indexEmailJob  → no-op (dual-write becomes a no-write)
+ *   - searchEmailJobs→ throws SearchUnavailableError (query service falls
+ *                      back to Postgres)
+ *   - getEmailJobDoc → null (detail route falls back)
+ *   - ensureEmailJobsIndex / reindex → skipped
+ */
+export function isSearchEnabled(): boolean {
+  const url = process.env.ELASTICSEARCH_URL?.trim();
+  return url !== undefined && url !== "" && url.toLowerCase() !== "disabled";
+}
+
+/** Thrown when ES is disabled or unreachable — callers fall back to Postgres. */
+export class SearchUnavailableError extends Error {
+  constructor(reason: string) {
+    super(`Elasticsearch unavailable: ${reason}`);
+    this.name = "SearchUnavailableError";
+  }
+}
+
 let client: Client | null = null;
 
 function getClient(): Client {
+  if (!isSearchEnabled()) throw new SearchUnavailableError("disabled (ELASTICSEARCH_URL not set)");
   if (!client) {
-    const url = process.env.ELASTICSEARCH_URL;
-    if (!url) throw new Error("ELASTICSEARCH_URL is not set");
-    client = new Client({ node: url });
+    client = new Client({ node: process.env.ELASTICSEARCH_URL as string });
   }
   return client;
 }
@@ -32,7 +55,9 @@ const INDEX_MAPPING = {
   },
 } as const;
 
+/** Creates the index if ES is enabled. Returns true when it was created. */
 export async function ensureEmailJobsIndex(): Promise<boolean> {
+  if (!isSearchEnabled()) return false;
   const es = getClient();
   const exists = await es.indices.exists({ index: EMAIL_JOBS_INDEX });
   if (exists) return false;
@@ -61,9 +86,10 @@ export interface EmailJobDoc {
 
 /**
  * Idempotent upsert by job id — replaying the same index job twice just
- * overwrites with the same data (§7.2).
+ * overwrites with the same data (§7.2). No-op when ES is disabled.
  */
 export async function indexEmailJob(doc: EmailJobDoc): Promise<void> {
+  if (!isSearchEnabled()) return;
   const es = getClient();
   await es.index({
     index: EMAIL_JOBS_INDEX,
@@ -144,21 +170,27 @@ function mapHit(source: Record<string, unknown>): EsHit {
 }
 
 /**
- * ES-first list query. Throws on ES errors — callers (Query Module) catch and
- * fall back to Postgres per §7.3.
+ * ES-first list query. Throws SearchUnavailableError when ES is disabled or
+ * errors — callers (Query Module) catch and fall back to Postgres per §7.3.
  */
 export async function searchEmailJobs(
   p: SearchParams
 ): Promise<{ items: EsHit[]; total: number }> {
-  const es = getClient();
-  const resp = await es.search({
-    index: EMAIL_JOBS_INDEX,
-    query: buildQuery(p),
-    sort: [{ [p.sortField]: { order: p.sortOrder } }],
-    from: (p.page - 1) * p.pageSize,
-    size: p.pageSize,
-    track_total_hits: true,
-  });
+  let resp;
+  try {
+    const es = getClient();
+    resp = await es.search({
+      index: EMAIL_JOBS_INDEX,
+      query: buildQuery(p),
+      sort: [{ [p.sortField]: { order: p.sortOrder } }],
+      from: (p.page - 1) * p.pageSize,
+      size: p.pageSize,
+      track_total_hits: true,
+    });
+  } catch (err) {
+    if (err instanceof SearchUnavailableError) throw err;
+    throw new SearchUnavailableError((err as Error).message);
+  }
   const total =
     typeof resp.hits.total === "number"
       ? resp.hits.total
@@ -167,10 +199,11 @@ export async function searchEmailJobs(
   return { items, total };
 }
 
-/** Single-doc fetch — used by the detail route (ES-first). */
+/** Single-doc fetch — used by the detail route (ES-first). Null when disabled. */
 export async function getEmailJobDoc(id: string): Promise<EsHit | null> {
-  const es = getClient();
+  if (!isSearchEnabled()) return null;
   try {
+    const es = getClient();
     const resp = await es.get({ index: EMAIL_JOBS_INDEX, id }, { ignore: [404] });
     if (!resp || resp.found === false || !resp._source) return null;
     return mapHit(resp._source as Record<string, unknown>);

@@ -1,0 +1,94 @@
+# Render Blueprint — one always-on API service (workers in-process), one web service.
+# Deploy: Render Dashboard → New → Blueprint → pick this repo → Apply.
+# Free tier: services spin down after ~15 min idle; first request takes ~50s to wake.
+#
+# NOTE ON FREE TIER: Render free Postgres expires after 30 days (recreate and
+# the preDeploy command re-migrates/seeds). The free Key Value (Redis-compatible)
+# persists. Elasticsearch has no free managed host — this deployment runs the
+# whole engine WITHOUT ES: packages/search owns the availability policy, the
+# query service falls back to Postgres (§7.3), index/reindex become no-ops.
+# Set ELASTICSEARCH_URL later to enable ES with zero code changes.
+
+databases:
+  - name: reachinbox-db
+    databaseName: reachinbox
+    user: reachinbox
+    plan: free
+
+services:
+  # ---- Redis-compatible Key Value (free, persists) ----
+  - type: keyvalue
+    name: reachinbox-kv
+    plan: free
+    maxmemoryPolicy: noeviction
+
+  # ---- API + in-process BullMQ workers (one always-on Node service) ----
+  - type: web
+    name: reachinbox-api
+    runtime: node
+    plan: free
+    rootDir: . # monorepo root — the pnpm workspace resolves from here
+    buildCommand: corepack enable && pnpm install --frozen-lockfile && pnpm -r build
+    preDeployCommand: sh infra/render/predeploy.sh
+    startCommand: node apps/api/dist/server.js
+    healthCheckPath: /api/health
+    autoDeploy: true
+    envVars:
+      - key: NODE_VERSION
+        value: "20"
+      - key: DATABASE_URL
+        fromDatabase:
+          name: reachinbox-db
+          property: connectionString
+      - key: REDIS_URL
+        fromService:
+          name: reachinbox-kv
+          type: keyvalue
+          property: url
+      # ES disabled → PG fallback everywhere (see note above). Set to enable.
+      - key: ELASTICSEARCH_URL
+        sync: false
+      - key: SESSION_SECRET
+        generateValue: true
+      # 64 hex chars — generate with: openssl rand -hex 32
+      - key: ENCRYPTION_KEY
+        sync: false
+      - key: COOKIE_SECURE
+        value: "true" # Render serves HTTPS
+      - key: WORKER_INPROCESS
+        value: "true"
+      - key: ATTACHMENT_DATA_DIR
+        value: /tmp/attachments
+      - key: GOOGLE_CLIENT_ID
+        sync: false
+      - key: GOOGLE_CLIENT_SECRET
+        sync: false
+      - key: WEB_URL
+        sync: false # e.g. https://reachinbox-web.onrender.com
+      # Leave unset to auto-derive the OAuth redirect URI per browsing origin.
+      - key: GOOGLE_REDIRECT_URI
+        sync: false
+      - key: SLACK_CLIENT_ID
+        sync: false
+      - key: SLACK_CLIENT_SECRET
+        sync: false
+
+  # ---- Next.js dashboard (free web service; proxies /api + /admin to the API) ----
+  - type: web
+    name: reachinbox-web
+    runtime: node
+    plan: free
+    rootDir: .
+    buildCommand: corepack enable && pnpm install --frozen-lockfile && pnpm --filter @reachinbox/shared-types build && pnpm --filter @reachinbox/web build
+    startCommand: pnpm --filter @reachinbox/web start
+    healthCheckPath: /
+    autoDeploy: true
+    envVars:
+      - key: NODE_VERSION
+        value: "20"
+      - key: API_INTERNAL_URL
+        sync: false # e.g. https://reachinbox-api.onrender.com
+      - key: NEXT_PUBLIC_API_URL
+        sync: false # same value — used by the browser bundle
+      - key: WEB_URL
+        sync: false # e.g. https://reachinbox-web.onrender.com

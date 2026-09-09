@@ -1,106 +1,81 @@
-# Deployment
+# Deployment — Render (free tier)
 
-## What deploys where
+The whole product deploys to **Render's free tier** with zero code changes:
 
-| Piece | Host | Why |
+| Piece | Render service | Why this fits |
 |---|---|---|
-| `apps/web` (Next.js dashboard) | **Vercel** | Made for it — rewrites proxy `/api/*` and `/admin/*` to the API URL |
-| `apps/api` (Express REST API) | **Vercel** (serverless) or any Node host | `api/index.js` entry included; long-running hosts (Render/Railway/Fly/your VPS) are simpler for websockets-style features like Bull Board |
-| BullMQ **send worker** (`apps/worker`) | **Any always-on Node host** (Render worker/Railway/Fly/VPS) | Background workers are long-lived processes; they must NOT run on serverless |
-| Postgres / Redis / Elasticsearch | **Managed services** (Neon/Supabase, Upstash/Redis Cloud, Elastic Cloud/Bonsai) | Vercel has no durable stateful add-ons for this stack |
+| `apps/api` + **all BullMQ workers** | 1 × free **web service** (`WORKER_INPROCESS=true`) | The engine's guarantees (boot reconciliation, lease reclamation, deferral) need a **long-lived process** — exactly what a Render web service is. Workers run in-process via the same `startWorkers()` the standalone worker uses — no duplicated logic. |
+| `apps/web` (Next.js dashboard) | 1 × free **web service** | `next start` + the `/api` + `/admin` rewrites proxy to the API — browser talks to one origin, cookies stay first-party. |
+| Postgres | free **database** | Connection string auto-injected as `DATABASE_URL`. |
+| Redis | free **Key Value** instance | BullMQ + rate-limit counters + sessions' store backend (sessions persist in PG). |
+| Elasticsearch | **none (optional)** | No free managed ES exists. `packages/search` owns availability: unset `ELASTICSEARCH_URL` → index writes are no-ops and **search falls back to Postgres (§7.3)**. Set it anytime to enable ES with zero code changes. |
 
-> **Honest constraint:** Vercel is first-class for `apps/web`, workable for
-> `apps/api` (stateless HTTP — sessions live in Postgres, so serverless is safe),
-> and wrong for `apps/worker`. The engine's guarantees (restart reconciliation,
-> deferral, lease reclamation) assume a long-lived worker. Free tiers of
-> Render/Railway/Fly all fit.
+Free-tier notes: web services spin down after ~15 min idle (first request wakes
+in ~50 s — schedule sends run while the service is awake; the reconciler
+re-enqueues anything missed after a cold start). The free Postgres expires
+after 30 days — recreate it and the preDeploy command re-migrates and re-seeds.
 
-## 1. Managed data stores
+## 1. One-click-ish: Blueprint
 
-Provision Postgres, Redis, and Elasticsearch (any providers), then collect:
+1. Push this repo to GitHub (done: `github.com/BugHunterX2101/ReachInbox`).
+2. Render Dashboard → **New → Blueprint** → select the repo → Render reads
+   `render.yaml` (databases + both services + wiring).
+3. Fill the `sync: false` env vars when prompted:
+   - `ENCRYPTION_KEY` — `openssl rand -hex 32`
+   - `GOOGLE_CLIENT_ID` / `GOOGLE_CLIENT_SECRET` — from Google Cloud Console
+   - `WEB_URL` — the **web** service URL, e.g. `https://reachinbox-web.onrender.com`
+   - `API_INTERNAL_URL` + `NEXT_PUBLIC_API_URL` (web service) — the **API**
+     service URL, e.g. `https://reachinbox-api.onrender.com`
+   - `ELASTICSEARCH_URL` — leave empty (PG fallback) or point at a host
+   - `GOOGLE_REDIRECT_URI` — leave empty (auto-derived per origin)
+
+Every deploy then runs `predeploy.sh`: idempotent schema migration, tenant +
+sender seeding, and best-effort Ethereal SMTP provisioning (cached in
+`.ethereal-accounts.json`, which is deliberately not committed).
+
+## 2. Google OAuth — fixing `Error 400: redirect_uri_mismatch`
+
+Google rejects the sign-in unless the `redirect_uri` the app sends matches a
+URI registered on the OAuth client **exactly** (scheme, host, port, path).
+
+After the first deploy, open `https://<api>.onrender.com/api/health` — it
+returns `googleRedirectUris`, the exact list the running deployment expects.
+Add **all** of these in **Google Cloud Console → APIs & Services → Credentials
+→ your OAuth client → Authorized redirect URIs**:
 
 ```
-DATABASE_URL=postgres://…        # e.g. Neon/Supabase
-REDIS_URL=redis://…              # e.g. Upstash (use rediss:// for TLS)
-ELASTICSEARCH_URL=https://…      # e.g. Elastic Cloud / Bonsai
+https://<web>.onrender.com/api/auth/google/callback
+https://<api>.onrender.com/api/auth/google/callback
+http://localhost:3000/api/auth/google/callback        (local dashboard)
+http://localhost:3001/api/auth/google/callback        (local API direct)
 ```
 
-## 2. OAuth apps (fixes `Error 400: redirect_uri_mismatch`)
+Also add **Authorized JavaScript origins**: both `https://<web>.onrender.com`
+and `http://localhost:3000`.
 
-**Google Cloud Console → APIs & Services → Credentials** → your OAuth client:
+How it works: with `GOOGLE_REDIRECT_URI` unset (recommended), the redirect URI
+is derived from the origin the browser actually uses — browsing the dashboard
+at `<web>` sends `<web>/api/auth/google/callback`, hitting the API directly
+sends `<api>/…`. PKCE (S256) + `nonce` + session-bound state are always on.
 
-1. **Authorized JavaScript origins**: your Vercel web URL(s), e.g.
-   `https://reachinbox.vercel.app` (and `http://localhost:3000` for local dev).
-2. **Authorized redirect URIs** — add ALL of these that apply, exactly:
-   - `https://<your-web>.vercel.app/api/auth/google/callback` (dashboard via proxy)
-   - `https://<your-api>.vercel.app/api/auth/google/callback` (only if you also deploy the API to Vercel and will browse it directly)
-   - `http://localhost:3000/api/auth/google/callback` + `http://localhost:3001/api/auth/google/callback` (local dev)
+Slack follows the same rule: **OAuth & Permissions → Redirect URLs** →
+`https://<web>.onrender.com/api/integrations/slack/callback` (and local).
 
-   After deploy, `GET /api/health` returns `googleRedirectUris` — the exact list
-   the running deployment expects. What Google receives is derived from the
-   browsing origin (or `GOOGLE_REDIRECT_URI` if set), so a mismatch is always
-   visible there.
+## 3. First-run checklist
 
-**Slack app settings** → OAuth & Permissions → Redirect URLs:
-`https://<host>/api/integrations/slack/callback` (same origin rule).
+1. `GET https://<api>.onrender.com/api/health` → `ok:true`, `googleConfigured:true`.
+2. Open `https://<web>.onrender.com` → **Login with Google** → consent → dashboard.
+3. Compose → 2 recipients → schedule → watch **Sent** fill up (Ethereal SMTP;
+   view messages at https://ethereal.email with the seeded sender credentials —
+   `pnpm db:verify:senders` prints them locally).
+4. **Bull Board**: `https://<web>.onrender.com/admin/queues` (auth-gated).
+5. Search: the dashboard search box queries ES when enabled, Postgres otherwise —
+   identical results either way.
 
-## 3. Vercel — web + api
+## 4. Legacy: running the split topology anywhere
 
-```bash
-npm i -g vercel
-vercel login
-
-# Dashboard
-cd apps/web
-vercel link
-vercel env add API_INTERNAL_URL        # e.g. https://reachinbox-api.vercel.app
-vercel env add NEXT_PUBLIC_API_URL     # same value, for the browser
-vercel env add WEB_URL                 # e.g. https://reachinbox.vercel.app
-vercel --prod
-
-# API
-cd apps/api
-vercel link
-vercel env add DATABASE_URL
-vercel env add REDIS_URL
-vercel env add ELASTICSEARCH_URL
-vercel env add SESSION_SECRET          # 32+ random chars
-vercel env add ENCRYPTION_KEY          # 64 hex chars (openssl rand -hex 32)
-vercel env add GOOGLE_CLIENT_ID
-vercel env add GOOGLE_CLIENT_SECRET
-vercel env add WEB_URL                 # the Vercel web URL (OAuth redirect target)
-# Optional — leave unset to auto-derive per-origin:
-# vercel env add GOOGLE_REDIRECT_URI
-# vercel env add SLACK_CLIENT_ID / SLACK_CLIENT_SECRET
-vercel --prod
-```
-
-`apps/api/index.js` is the serverless entry (wraps `dist/app.js`). Sessions are
-server-side in Postgres, so serverless instances stay stateless and safe.
-
-## 4. Worker — one always-on host
-
-```bash
-# On Render/Railway/Fly/VPS with Node 20+:
-git clone https://github.com/BugHunterX2101/ReachInbox && cd ReachInbox
-corepack enable && pnpm install && pnpm -r build
-# Env: DATABASE_URL, REDIS_URL, ELASTICSEARCH_URL, ENCRYPTION_KEY, SESSION_SECRET,
-#      QUEUE_PREFIX (use a DIFFERENT prefix from local dev!), WORKER_CONCURRENCY…
-node apps/worker/dist/index.js
-```
-
-The worker runs the boot reconciler on start (FR-9/10/11), so even after long
-downtime it resumes exactly where Postgres says things left off.
-
-## 5. Migrate + seed (run once, from anywhere with access to the stores)
-
-```bash
-pnpm db:migrate && pnpm db:seed && pnpm db:seed:ethereal && pnpm db:verify:senders
-```
-
-## 6. Verify
-
-1. `GET <api>/api/health` → `ok:true` and the expected `googleRedirectUris`.
-2. Open the web app → **Login with Google** → consent → dashboard.
-3. Compose a 2-recipient batch → watch it deliver, then check **Bull Board**
-   (`/admin/queues`) and the **Sent** view.
+Any host pairs fine with the classic layout (API and `apps/worker` as separate
+long-lived processes; leave `WORKER_INPROCESS` unset). The worker needs the
+same env (stores, `ENCRYPTION_KEY`, `QUEUE_PREFIX` — use a **different prefix**
+per environment) plus `node apps/worker/dist/index.js`. The boot reconciler
+resumes exactly where Postgres says things left off after downtime.

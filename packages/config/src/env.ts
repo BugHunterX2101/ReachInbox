@@ -29,7 +29,17 @@ const envSchema = z.object({
   // --- Data stores ---
   DATABASE_URL: z.string().url().or(z.string().startsWith("postgres://")),
   REDIS_URL: z.string().default("redis://localhost:6379"),
-  ELASTICSEARCH_URL: z.string().default("http://localhost:9200"),
+  // Optional — Elasticsearch is a read optimization with a Postgres fallback
+  // (§7.3). Empty or "disabled" runs the whole engine without ES.
+  ELASTICSEARCH_URL: z.string().default(""),
+
+  // Run the BullMQ workers inside the API process (single-service deploys,
+  // e.g. one always-on Render web service). Leave unset for the classic
+  // split deployment with apps/worker as its own long-lived process.
+  WORKER_INPROCESS: z
+    .enum(["true", "false"])
+    .default("false")
+    .transform((v) => v === "true"),
 
   // --- Worker tuning (FR-16, FR-18, FR-19) ---
   WORKER_CONCURRENCY: intSchema(10),

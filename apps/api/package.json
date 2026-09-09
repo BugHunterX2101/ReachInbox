@@ -19,6 +19,7 @@
     "@reachinbox/queues": "workspace:*",
     "@reachinbox/search": "workspace:*",
     "@reachinbox/shared-types": "workspace:*",
+    "@reachinbox/worker": "workspace:*",
     "connect-pg-simple": "^10.0.0",
     "cors": "^2.8.5",
     "express": "^4.21.2",
