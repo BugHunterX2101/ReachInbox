@@ -1,0 +1,19 @@
+{
+  "mappings": {
+    "properties": {
+      "id": { "type": "keyword" },
+      "batchId": { "type": "keyword" },
+      "tenantId": { "type": "keyword" },
+      "senderId": { "type": "keyword" },
+      "senderEmail": { "type": "keyword" },
+      "recipient": { "type": "text", "fields": { "raw": { "type": "keyword" } } },
+      "subject": { "type": "text" },
+      "status": { "type": "keyword" },
+      "scheduledAt": { "type": "date" },
+      "sentAt": { "type": "date" },
+      "createdAt": { "type": "date" },
+      "error": { "type": "text" },
+      "attempts": { "type": "integer" }
+    }
+  }
+}

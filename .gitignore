@@ -1,0 +1,16 @@
+node_modules/
+dist/
+build/
+.next/
+*.tsbuildinfo
+.env
+.env.local
+.env*.local
+.ethereal-accounts.json
+.data/
+coverage/
+logs/
+*.log
+.DS_Store
+.freebuff/
+.vercel

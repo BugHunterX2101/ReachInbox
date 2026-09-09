@@ -1,0 +1,21 @@
+{
+  "name": "reachinbox-email-scheduler",
+  "private": true,
+  "version": "1.0.0",
+  "description": "Email Job Scheduler & Dashboard — Outbox Labs / ReachInbox.ai",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "build": "pnpm -r build",
+    "typecheck": "pnpm -r typecheck",
+    "test": "pnpm -r test",
+    "dev:api": "pnpm --filter @reachinbox/api dev",
+    "dev:worker": "pnpm --filter @reachinbox/worker dev",
+    "dev:web": "pnpm --filter @reachinbox/web dev",
+    "db:migrate": "pnpm --filter @reachinbox/db-schema migrate",
+    "db:seed": "pnpm --filter @reachinbox/db-schema seed",
+    "db:seed:ethereal": "pnpm --filter @reachinbox/db-schema seed:ethereal",
+    "db:verify:senders": "pnpm --filter @reachinbox/db-schema verify:senders"
+  }
+}
