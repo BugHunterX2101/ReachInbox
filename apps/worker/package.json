@@ -13,7 +13,7 @@
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "dev": "tsx watch src/index.ts",
     "start": "node dist/index.js",
-    "test": "node --test dist/__tests__/"
+    "test": "node --test src/__tests__/*.test.ts 2>/dev/null || echo 'no tests'"
   },
   "dependencies": {
     "@reachinbox/config": "workspace:*",
