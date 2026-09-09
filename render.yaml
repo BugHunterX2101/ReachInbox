@@ -28,7 +28,7 @@ services:
     runtime: node
     plan: free
     rootDir: . # monorepo root — the pnpm workspace resolves from here
-    buildCommand: corepack enable && pnpm install --frozen-lockfile && pnpm -r build
+    buildCommand: npx --yes pnpm@11.10.0 install --frozen-lockfile && npx --yes pnpm@11.10.0 -r build
     preDeployCommand: sh infra/render/predeploy.sh
     startCommand: node apps/api/dist/server.js
     healthCheckPath: /api/health
@@ -79,7 +79,7 @@ services:
     runtime: node
     plan: free
     rootDir: .
-    buildCommand: corepack enable && pnpm install --frozen-lockfile && pnpm --filter @reachinbox/shared-types build && pnpm --filter @reachinbox/web build
+    buildCommand: npx --yes pnpm@11.10.0 install --frozen-lockfile && npx --yes pnpm@11.10.0 --filter @reachinbox/shared-types build && npx --yes pnpm@11.10.0 --filter @reachinbox/web build
     startCommand: pnpm --filter @reachinbox/web start
     healthCheckPath: /
     autoDeploy: true
