@@ -3,6 +3,7 @@
   "private": true,
   "version": "1.0.0",
   "description": "Email Job Scheduler & Dashboard — Outbox Labs / ReachInbox.ai",
+  "packageManager": "pnpm@11.10.0",
   "engines": {
     "node": ">=20"
   },
