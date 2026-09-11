@@ -8,7 +8,7 @@
 - Watch everything live: queue depths, rate counters, every state transition.
 
 
-## 🔗 Live deployment (Render)
+##  Live deployment (Render)
 
 - **Dashboard (Next.js):** https://reachinbox-web-kugh.onrender.com
 - **API health (Express):** https://reachinbox-api-1187.onrender.com/api/health
@@ -86,11 +86,7 @@ flowchart LR
     RW -- "drift heal" --> ES
 ```
 
-The one rule that ties it together:
 
-- **The send path never touches Elasticsearch.**
-- **The read path never mutates job state.**
-- **Postgres is the record of intent and outcome; Redis is the mechanism that makes it happen on time; ES is a cache you can delete.**
 
 ### Job lifecycle
 
@@ -284,4 +280,3 @@ Cloud verification (against the deployed Render stack):
 - As of 2026-09-11, `smtp.ethereal.email:2525` accepts TCP but stalls before its banner (an upstream Ethereal outage) — so free instances currently cannot deliver mail until that recovers.
 - The engine behaves correctly meanwhile: transient failures climb the retry ladder, rows end `failed` (or defer under a rate cap), and the reconciler re-enqueues missed work after restarts.
 - Fixes when needed: upgrade the API service to a paid plan (unblocks 587), or swap the transport for an HTTP email API — the worker depends only on the `MailTransport` interface, so this is a one-module change (`apps/worker/src/mailer/`).
-- Details: **[DEPLOY.md §4](DEPLOY.md)**.
