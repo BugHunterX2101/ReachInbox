@@ -6,23 +6,13 @@
 - Throttle like a deliverability-conscious sender: **dual hourly caps** (tenant + sender) + per-batch pacing.
 - Survive crashes mid-send with **exactly-once delivery** — `kill -9`, restart, and the batch finishes exactly where it left off.
 - Watch everything live: queue depths, rate counters, every state transition.
-
-**Verified end-to-end, not claimed:**
-
-- A **26-check E2E harness** drives the real HTTP API, real SMTP (Ethereal), real Elasticsearch, and a live Redis-loss disaster.
-- The harness kills Redis mid-batch and proves the reconciler re-enqueues everything from Postgres — **zero duplicates, zero lost leads**.
-- The deployed cloud stack passes a **14-check non-SMTP cloud E2E** (`scripts/e2e-cloud-nosmtp.mjs`).
-
 ---
 
 ## 🔗 Live deployment (Render)
 
-The product is deployed on **Render** — this is the only deployment target:
-
 - **Dashboard (Next.js):** https://reachinbox-web-kugh.onrender.com
 - **API health (Express):** https://reachinbox-api-1187.onrender.com/api/health
 - **Bull Board (auth-gated):** https://reachinbox-web-kugh.onrender.com/admin/queues
-- **Source:** https://github.com/BugHunterX2101/ReachInbox
 
 What the deployed topology looks like:
 
