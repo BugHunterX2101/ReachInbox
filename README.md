@@ -6,7 +6,7 @@
 - Throttle like a deliverability-conscious sender: **dual hourly caps** (tenant + sender) + per-batch pacing.
 - Survive crashes mid-send with **exactly-once delivery** — `kill -9`, restart, and the batch finishes exactly where it left off.
 - Watch everything live: queue depths, rate counters, every state transition.
----
+
 
 ## 🔗 Live deployment (Render)
 
