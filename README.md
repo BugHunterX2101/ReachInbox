@@ -2,22 +2,53 @@
 
 **A production-grade email scheduling engine that never loses, duplicates, or silently drops an email** — with a real-time dashboard for users and engineers.
 
-Schedule thousands of emails precisely with BullMQ delayed jobs, throttle them like a deliverability-conscious sender (dual hourly caps + per-batch pacing), survive crashes mid-send with **exactly-once delivery**, and watch everything live — queue depths, rate counters, every state transition.
+- Schedule thousands of emails with **BullMQ delayed jobs**, precisely paced.
+- Throttle like a deliverability-conscious sender: **dual hourly caps** (tenant + sender) + per-batch pacing.
+- Survive crashes mid-send with **exactly-once delivery** — `kill -9`, restart, and the batch finishes exactly where it left off.
+- Watch everything live: queue depths, rate counters, every state transition.
 
-**Verified end-to-end, not claimed:** a 26-check E2E harness drives the real HTTP API, real SMTP (Ethereal), real Elasticsearch, and a live Redis-loss disaster — including killing Redis mid-batch and proving the reconciler re-enqueues everything from Postgres with zero duplicates and zero lost leads.
+**Verified end-to-end, not claimed:**
+
+- A **26-check E2E harness** drives the real HTTP API, real SMTP (Ethereal), real Elasticsearch, and a live Redis-loss disaster.
+- The harness kills Redis mid-batch and proves the reconciler re-enqueues everything from Postgres — **zero duplicates, zero lost leads**.
+- The deployed cloud stack passes a **14-check non-SMTP cloud E2E** (`scripts/e2e-cloud-nosmtp.mjs`).
 
 ---
 
+## 🔗 Live deployment (Render)
+
+The product is deployed on **Render** — this is the only deployment target:
+
+- **Dashboard (Next.js):** https://reachinbox-web-kugh.onrender.com
+- **API health (Express):** https://reachinbox-api-1187.onrender.com/api/health
+- **Bull Board (auth-gated):** https://reachinbox-web-kugh.onrender.com/admin/queues
+- **Source:** https://github.com/BugHunterX2101/ReachInbox
+
+What the deployed topology looks like:
+
+- `reachinbox-api` — one always-on **free web service** running the API **with all BullMQ workers in-process** (`WORKER_INPROCESS=true`).
+- `reachinbox-web` — one **free web service** running the Next.js dashboard; `/api` and `/admin` proxy to the API so the browser talks to one origin and cookies stay first-party.
+- `reachinbox-kv` — Render **Key Value** (Redis-compatible) for BullMQ queues + hourly rate counters.
+- **Neon Postgres** (external) — job truth, sessions, AES-encrypted secrets; no 30-day expiry.
+- **Elasticsearch** — deliberately **disabled** on the free tier; search falls back to Postgres with identical results. Set `ELASTICSEARCH_URL` anytime to enable ES with **zero code changes**.
+
+Free-tier behavior to expect:
+
+- Web services spin down after ~15 minutes idle; the first request wakes one in ~50 seconds.
+- The boot reconciler re-enqueues anything missed across a cold start — spin-downs are survivable by design.
+- Full deployment walkthrough (OAuth, secrets, verification): **[DEPLOY.md](DEPLOY.md)**.
+
 ## Highlights
 
-- **Restart-safe by construction** — Postgres owns job truth; a boot reconciler re-enqueues anything Redis lost and reclaims stale processing leases. `kill -9` mid-batch, restart, and the batch finishes exactly where it left off.
+- **Restart-safe by construction** — Postgres owns job truth; a boot reconciler re-enqueues anything Redis lost and reclaims stale processing leases.
 - **Exactly-once sends** — deterministic job IDs (`sha256(batchId:recipient)`), DB status re-checked under a lease before every SMTP send, guarded state transitions.
 - **Rate limits defer, never drop** — one atomic Lua script enforces tenant-wide **and** per-sender hourly caps; an over-cap send slides to the next hour window with **zero attempts burned**.
-- **Smart retries** — transient SMTP failures (421/450/451/452) climb a 30s → 60s → 120s ± jitter ladder; permanent failures (550/auth) fail fast.
-- **Search that never breaks the product** — Elasticsearch is a read optimization with a Postgres fallback; the whole engine runs with ES disabled (default on free hosting).
-- **Real OAuth, hardened** — Google login with PKCE (S256) + nonce + session-bound state; redirect URIs auto-derive from the browsing origin (kills the classic `redirect_uri_mismatch`).
+- **Smart retries** — transient SMTP failures (421/450/451/452) climb a `30s → 60s → 120s ± jitter` ladder; permanent failures (550/auth) fail fast.
+- **Search that never breaks the product** — Elasticsearch is a read optimization with a Postgres fallback; the whole engine runs with ES disabled.
+- **Real OAuth, hardened** — Google login with PKCE (S256) + nonce + session-bound state; redirect URIs auto-derive from the browsing origin.
 - **No cron, anywhere** — periodic drift correction is a BullMQ *repeatable* job, Redis-backed like everything else.
 - **Secrets encrypted at rest** — SMTP passwords and Slack tokens are AES-256-GCM; the key lives only in env.
+- **Live queue dashboard** — Bull Board at `/admin/queues`, auth-gated by the same session that protects the API.
 
 ## Architecture
 
@@ -65,7 +96,11 @@ flowchart LR
     RW -- "drift heal" --> ES
 ```
 
-**One rule ties it together:** the send path never touches Elasticsearch; the read path never mutates job state. Postgres is the record of intent and outcome; Redis is the mechanism that makes it happen on time; ES is a cache you can delete.
+The one rule that ties it together:
+
+- **The send path never touches Elasticsearch.**
+- **The read path never mutates job state.**
+- **Postgres is the record of intent and outcome; Redis is the mechanism that makes it happen on time; ES is a cache you can delete.**
 
 ### Job lifecycle
 
@@ -82,6 +117,39 @@ stateDiagram-v2
     failed --> [*]
 ```
 
+## The guarantees — and how they work
+
+- **Deterministic jobs** — `sha256(batchId + ":" + recipient).slice(0, 32)`; re-adding the same recipient is a no-op.
+- **Restart safety** — boot reconciler re-enqueues `scheduled` rows missing from Redis, reclaims stale `processing` leases; a Redis mutex prevents double-run.
+- **No double-send** — the worker re-reads DB status under the lease before sending; `sent` is a guarded UPDATE; redeliveries of `sent` jobs are acked and skipped.
+- **Atomic rate limiting** — one Lua script checks-then-increments every applicable counter; rejection happens *before* increment so counters never diverge.
+- **Deferral, never drop** — on cap: status stays `scheduled`, `scheduled_at` slides to the next hour window, `moveToDelayed` keeps the job queued with no attempt burned.
+- **Transient vs permanent** — 421/450/451/452 + connection errors → backoff ladder; 550/551/553/554/auth → immediate `discard()`.
+- **CSV hygiene** — recipients deduped + validated before scheduling; skipped rows reported back to the user.
+- **Slack never blocks sending** — token read at notify-time; failures logged and swallowed.
+- **ES drift self-heals** — index-queue dual-write + repeatable reindex pass + same-request Postgres fallback.
+
+## State ownership
+
+| Concern | Owner | Why |
+|---|---|---|
+| Job existence & status | **Postgres** `email_jobs` | Every transition is a guarded SQL UPDATE; Redis is never the truth |
+| Timing, counters, fan-out | **Redis / BullMQ** | Deterministic jobIds make re-enqueue idempotent; counters move in one Lua script or not at all |
+| Read / search | **Elasticsearch** (optional) | Written only by the index worker; API falls back to Postgres when ES is down or unset |
+| Env policy | `packages/config` | Parsed once, typed, shared — no duplicated defaults anywhere |
+| Contracts | `packages/shared-types` | The same zod schemas validate API input and type the dashboard |
+| Secrets | Postgres (AES-256-GCM) | Key only in `ENCRYPTION_KEY` env; one encrypt/decrypt path |
+| Sessions | Postgres `session` | Server-side; `requireAuth` re-reads the user on every request |
+
+## Features
+
+- **Google OAuth sign-in** — PKCE (S256) + nonce + session-bound state; per-origin redirect derivation (no more `redirect_uri_mismatch`).
+- **Compose & schedule** — subject/body with attachments, CSV upload or manual recipients, per-batch pacing (`delay between sends`) and optional per-batch hourly cap.
+- **Scheduled / Sent / Failed views** — live counts, batch drill-down, per-recipient status, retry and failure reasons.
+- **Full-text search** — by subject and recipient; ES when enabled, Postgres otherwise, identical UX.
+- **Slack integration** — per-tenant OAuth; rate-limit breach notifications that never block the send path.
+- **Admin queue board** — Bull Board behind session auth for real-time queue inspection.
+
 ## Repository structure
 
 ```
@@ -96,14 +164,14 @@ stateDiagram-v2
 │   │       └── modules/
 │   │           ├── auth/             # Google OAuth: PKCE + nonce, per-origin redirect derivation
 │   │           ├── schedule/         # schedule API, CSV recipient parsing, attachment store
-│   │           ├── query/            # lists/detail/search — ES-first, PG fallback (§7.3)
+│   │           ├── query/            # lists/detail/search — ES-first, PG fallback
 │   │           └── integrations/slack/  # Slack OAuth + status/disconnect
 │   ├── worker/                       # BullMQ worker pool (standalone process)
 │   │   └── src/
 │   │       ├── index.ts              # process wrapper (signals)
 │   │       ├── workers.ts            # startWorkers() — send/index/reindex workers, one owner
 │   │       ├── processors/
-│   │       │   ├── sendWorker.ts     # the send state machine (FR-12–21)
+│   │       │   ├── sendWorker.ts     # the send state machine
 │   │       │   ├── indexWorker.ts    # PG → ES dual-write
 │   │       │   └── reindexWorker.ts  # drift correction pass
 │   │       ├── mailer/               # Nodemailer transport + HMAC-fetched attachments
@@ -122,6 +190,7 @@ stateDiagram-v2
 │   │       ├── scheduler.ts          # deterministic fan-out (expandBatch)
 │   │       ├── rateLimiter.ts        # atomic Lua: tenant+sender(+batch) counters
 │   │       ├── reconciler.ts         # shared by API boot + worker boot
+│   │       ├── sendPolicy.ts         # pure retry/defer/fail decision + delay
 │   │       ├── smtpErrors.ts         # transient vs permanent taxonomy
 │   │       └── backoff.ts            # 30s/60s/120s ± jitter ladder
 │   ├── search/                       # ES client — mapping, idempotent upsert, queries,
@@ -130,26 +199,18 @@ stateDiagram-v2
 │   └── config/                       # typed env policy — every limit env-driven
 ├── infra/
 │   ├── docker/                       # Dockerfiles (api · worker · web)
-│   └── render/predeploy.sh           # idempotent migrate + seed for Render deploys
+│   └── render/                       # predeploy.sh (migrate+seed) · boot-setup.sh
 ├── scripts/
-│   ├── e2e.mjs                       # 26-check end-to-end verification harness
-│   └── reconcile-once.mjs            # one reconciliation pass (FR-9/10/11 demo)
+│   ├── e2e.mjs                       # 26-check end-to-end verification harness (local)
+│   ├── e2e-cloud.mjs                 # full cloud E2E against the deployed Render stack
+│   ├── e2e-cloud-nosmtp.mjs          # non-SMTP cloud E2E (14 checks)
+│   ├── render-deploy.mjs             # API-driven Render deploy orchestrator
+│   ├── smtp-probe.mjs                # SMTP reachability + credential probe
+│   └── reconcile-once.mjs            # one reconciliation pass (hands-on demo)
 ├── docker-compose.yml                # postgres + redis(AOF) + elasticsearch (+ apps)
-├── render.yaml                       # Render Blueprint: free PG + KV + 2 services
+├── render.yaml                       # Render Blueprint: Key Value + 2 web services
 └── DEPLOY.md                         # deployment guide (Render free tier + OAuth setup)
 ```
-
-## State ownership
-
-| Concern | Owner | Why |
-|---|---|---|
-| Job existence & status | **Postgres** `email_jobs` | Every transition is a guarded SQL UPDATE; Redis is never the truth |
-| Timing, counters, fan-out | **Redis / BullMQ** | Deterministic jobIds make re-enqueue idempotent; counters move in one Lua script or not at all |
-| Read / search | **Elasticsearch** (optional) | Written only by the index worker; API falls back to Postgres when ES is down or unset |
-| Env policy | `packages/config` | Parsed once, typed, shared — no duplicated defaults anywhere |
-| Contracts | `packages/shared-types` | The same zod schemas validate API input and type the dashboard |
-| Secrets | Postgres (AES-256-GCM) | Key only in `ENCRYPTION_KEY` env; one encrypt/decrypt path |
-| Sessions | Postgres `session` | Server-side; `requireAuth` re-reads the user on every request |
 
 ## Quickstart (local)
 
@@ -171,34 +232,10 @@ pnpm dev:worker   # BullMQ workers — same
 pnpm dev:web      # :3000 — proxies /api and /admin/queues to :3001
 ```
 
-Open **http://localhost:3000** → Login with Google → Compose. Mail is delivered
-through Ethereal (Nodemailer's test SMTP — nothing reaches the public internet;
-every message is viewable at ethereal.email with the seeded credentials).
-
-**The 60-second restart-safety demo:** schedule a batch with a large
-delay-between-sends → `docker compose kill worker` mid-batch → restart it. The
-boot reconciler re-enqueues everything Postgres says is unfinished, reclaims
-stale leases, and the batch completes with every job `sent` exactly once.
-
-Single-service mode: `WORKER_INPROCESS=true` runs the same workers inside the
-API process (`pnpm start` in `apps/api`) — how the Render deployment works.
-
-## Deployment — Render (free tier)
-
-`render.yaml` is a complete [Blueprint](DEPLOY.md): free Postgres + free
-Key Value (Redis-compatible) + two free web services — the API with workers
-in-process, and the Next.js dashboard. Elasticsearch stays **disabled** on the
-free tier by design (the search package owns that policy; Postgres serves every
-read) — set `ELASTICSEARCH_URL` anytime to light ES up with zero code changes.
-
-```bash
-# After connecting the GitHub repo:
-# Render Dashboard → New → Blueprint → Apply → fill the prompted secrets.
-```
-
-`DEPLOY.md` walks through OAuth redirect URIs (the `/api/health` endpoint prints
-the exact URIs to register in Google Cloud Console), free-tier behavior
-(spin-down/wake, 30-day Postgres), and verification steps.
+- Open **http://localhost:3000** → Login with Google → Compose.
+- Mail is delivered through **Ethereal** (Nodemailer's test SMTP — nothing reaches the public internet; every message is viewable at ethereal.email with the seeded credentials).
+- **60-second restart-safety demo:** schedule a batch with a large delay-between-sends → `docker compose kill worker` mid-batch → restart it. The boot reconciler re-enqueues everything Postgres says is unfinished, reclaims stale leases, and the batch completes with every job `sent` exactly once.
+- Single-service mode: `WORKER_INPROCESS=true` runs the same workers inside the API process (`pnpm start` in `apps/api`) — exactly how the Render deployment runs.
 
 ## Configuration reference
 
@@ -222,54 +259,39 @@ Every limit is environment-driven — nothing hardcoded:
 | `SESSION_SECRET` / `ENCRYPTION_KEY` | Cookie signing / AES-256-GCM (64 hex) | — |
 | `COOKIE_SECURE` | Set `true` behind HTTPS | `false` |
 
-Caps also resolve per-row (`tenants`, `senders`) and per-batch (`hourlyLimit`
-in Compose) — most specific wins, enforced atomically across **all** applicable
-counters in one Lua script.
+Cap resolution, most specific wins — all enforced atomically across **all** applicable counters in one Lua script:
 
-## How the guarantees work
-
-| Guarantee | Mechanism |
-|---|---|
-| Deterministic jobs | `sha256(batchId + ":" + recipient).slice(0,32)` — re-adding is a no-op |
-| Restart safety | Boot reconciler: re-enqueues `scheduled` rows missing from Redis, reclaims stale `processing` leases, Redis mutex prevents double-run |
-| No double-send | Worker re-reads DB status under the lease before sending; `sent` is a guarded UPDATE; redeliveries of `sent` jobs are acked and skipped |
-| Atomic rate limiting | One Lua script checks-then-increments every applicable counter — reject *before* increment so counters never diverge |
-| Deferral, never drop | On cap: status stays `scheduled`, `scheduled_at` → next hour window, `moveToDelayed` keeps the job queued with **no attempt burned** |
-| Transient vs permanent | 421/450/451/452 + connection errors → backoff ladder; 550/551/553/554/auth → `discard()` immediately |
-| CSV hygiene | Deduped + validated before scheduling; skipped rows reported to the user |
-| Slack never blocks sending | Token read at notify-time; failures logged and swallowed |
-| ES drift | Index-queue dual-write + repeatable reindex + same-request Postgres fallback |
+- Per-row overrides on `tenants` and `senders`.
+- Per-batch override via `hourlyLimit` in Compose.
+- Tenant-wide default from `MAX_EMAILS_PER_HOUR`.
 
 ## Verification
 
 ```bash
 pnpm test                # unit: recipients parser, backoff ladder, rate-window keys,
                          # SMTP taxonomy, deterministic jobId
-node scripts/e2e.mjs     # 26-check E2E against the real stack (API + worker running)
+node scripts/e2e.mjs     # 26-check E2E against the real local stack (API + worker running)
 ```
 
-The E2E harness exercises: session auth → CSV upload (with dupe/invalid
-feedback) → attachment upload → two live batches (one with `hourlyLimit=2` to
-force deferral) → real SMTP delivery → ES search by subject and recipient →
-detail view + nav counts → Bull Board auth gate → Slack graceful-absence path →
-**Redis `FLUSHALL` mid-flight: lists still served from Postgres, reconciler
-re-enqueues everything, the recovery batch still delivers** → logout
-invalidation. `scripts/reconcile-once.mjs` runs a single reconciliation pass
-for hands-on FR-9/10/11 demos.
+The E2E harness exercises, in order:
 
-## FR traceability
+- Session auth → CSV upload (with dupe/invalid feedback) → attachment upload.
+- Two live batches — one with `hourlyLimit=2` to force a real deferral — through real SMTP delivery.
+- ES search by subject and recipient → detail view + nav counts.
+- Bull Board auth gate → Slack graceful-absence path.
+- **Redis `FLUSHALL` mid-flight:** lists still served from Postgres, reconciler re-enqueues everything, the recovery batch still delivers.
+- Logout invalidation.
 
-| FRs | Where |
-|---|---|
-| FR-1–3 · Google OAuth, header, logout | `apps/api/src/modules/auth`, `apps/web/src/app/login` |
-| FR-4–6 · Schedule API, validation, async fan-out | `apps/api/src/modules/schedule`, `packages/queues/scheduler` |
-| FR-7–9 · BullMQ-only, deterministic IDs, DB truth + reconcile | `packages/queues` (queues, jobId, reconciler) |
-| FR-10–12 · Restart persistence, recovery, explicit states | `packages/queues/reconciler`, `apps/worker/src/processors/sendWorker` |
-| FR-13–15 · Ethereal sending, multi-sender, retry/backoff | `apps/worker/src/mailer`, `packages/queues/{smtpErrors,backoff}` |
-| FR-16–18 · Concurrency, atomicity, delay-between-sends | `WORKER_CONCURRENCY`, `rateLimiter` (Lua), batch pacing |
-| FR-19–21 · Hourly caps, Redis-backed, deferral | `packages/queues/rateLimiter`, `sendWorker` deferral |
-| FR-22–25 · Slack OAuth + breach notify + graceful absence | `apps/api/src/modules/integrations/slack`, `apps/worker/src/slack` |
-| FR-26 · Live queue dashboard | Bull Board at `/admin/queues` |
-| FR-27–28 · ES indexing + filtered search | `packages/search`, `apps/api/src/modules/query` |
-| FR-29–32 · Dashboard shell, Compose, Scheduled/Sent | `apps/web/src/{app,components}` |
-| FR-33 · Typed, componentized, DRY | `packages/shared-types`, `apps/web/src/components/ui` |
+Cloud verification (against the deployed Render stack):
+
+- `node scripts/e2e-cloud.mjs` — full pass including SMTP delivery.
+- `node scripts/e2e-cloud-nosmtp.mjs` — 14/14 checks covering every non-SMTP surface.
+- `scripts/reconcile-once.mjs` — runs a single reconciliation pass for hands-on demos.
+
+## Known issue — SMTP egress on Render free instances
+
+- Render blocks outbound ports **25 / 465 / 587** on free web services (platform policy); the deployment seeds Ethereal senders on port **2525**, the sanctioned alternate submission port.
+- As of 2026-09-11, `smtp.ethereal.email:2525` accepts TCP but stalls before its banner (an upstream Ethereal outage) — so free instances currently cannot deliver mail until that recovers.
+- The engine behaves correctly meanwhile: transient failures climb the retry ladder, rows end `failed` (or defer under a rate cap), and the reconciler re-enqueues missed work after restarts.
+- Fixes when needed: upgrade the API service to a paid plan (unblocks 587), or swap the transport for an HTTP email API — the worker depends only on the `MailTransport` interface, so this is a one-module change (`apps/worker/src/mailer/`).
+- Details: **[DEPLOY.md §4](DEPLOY.md)**.

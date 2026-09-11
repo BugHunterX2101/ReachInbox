@@ -16,11 +16,11 @@
 #   ENCRYPTION_KEY   → 64 hex chars (openssl rand -hex 32) — MUST match existing key
 #                       if Neon DB already has encrypted sender passwords
 #   GOOGLE_CLIENT_ID/SECRET → from Google Cloud Console OAuth app
-#   GOOGLE_REDIRECT_URI     → https://reachinbox-web-<slug>.onrender.com/api/auth/google/callback
+#   GOOGLE_REDIRECT_URI     → https://reachinbox-web-kugh.onrender.com/api/auth/google/callback
 #   SLACK_CLIENT_ID/SECRET  → from api.slack.com app
-#   SLACK_REDIRECT_URI      → https://reachinbox-web-<slug>.onrender.com/api/integrations/slack/callback
-#   WEB_URL                 → https://reachinbox-web-<slug>.onrender.com
-#   API_INTERNAL_URL        → https://reachinbox-api-<slug>.onrender.com
+#   SLACK_REDIRECT_URI      → https://reachinbox-web-kugh.onrender.com/api/integrations/slack/callback
+#   WEB_URL                 → https://reachinbox-web-kugh.onrender.com
+#   API_INTERNAL_URL        → https://reachinbox-api-1187.onrender.com
 #   NEXT_PUBLIC_API_URL     → same as API_INTERNAL_URL
 
 services:

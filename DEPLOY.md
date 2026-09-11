@@ -26,9 +26,9 @@ after 30 days — recreate it and the preDeploy command re-migrates and re-seeds
 - `ENCRYPTION_KEY` — `openssl rand -hex 32` — **must match** the key that
   encrypted the sender passwords already in the Neon DB
 - `GOOGLE_CLIENT_ID` / `GOOGLE_CLIENT_SECRET` — from Google Cloud Console
-   - `WEB_URL` — the **web** service URL, e.g. `https://reachinbox-web.onrender.com`
+   - `WEB_URL` — the **web** service URL: `https://reachinbox-web-kugh.onrender.com`
    - `API_INTERNAL_URL` + `NEXT_PUBLIC_API_URL` (web service) — the **API**
-     service URL, e.g. `https://reachinbox-api.onrender.com`
+     service URL: `https://reachinbox-api-1187.onrender.com`
    - `ELASTICSEARCH_URL` — leave empty (PG fallback) or point at a host
    - `GOOGLE_REDIRECT_URI` — leave empty (auto-derived per origin)
 
@@ -41,20 +41,21 @@ sender seeding, and best-effort Ethereal SMTP provisioning (cached in
 Google rejects the sign-in unless the `redirect_uri` the app sends matches a
 URI registered on the OAuth client **exactly** (scheme, host, port, path).
 
-After the first deploy, open `https://<api>.onrender.com/api/health` — it
-returns `googleRedirectUris`, the exact list the running deployment expects.
+After the first deploy, open
+`https://reachinbox-api-1187.onrender.com/api/health` — it returns
+`googleRedirectUris`, the exact list the running deployment expects.
 Add **all** of these in **Google Cloud Console → APIs & Services → Credentials
 → your OAuth client → Authorized redirect URIs**:
 
 ```
-https://<web>.onrender.com/api/auth/google/callback
-https://<api>.onrender.com/api/auth/google/callback
+https://reachinbox-web-kugh.onrender.com/api/auth/google/callback
+https://reachinbox-api-1187.onrender.com/api/auth/google/callback
 http://localhost:3000/api/auth/google/callback        (local dashboard)
 http://localhost:3001/api/auth/google/callback        (local API direct)
 ```
 
-Also add **Authorized JavaScript origins**: both `https://<web>.onrender.com`
-and `http://localhost:3000`.
+Also add **Authorized JavaScript origins**: both
+`https://reachinbox-web-kugh.onrender.com` and `http://localhost:3000`.
 
 How it works: with `GOOGLE_REDIRECT_URI` unset (recommended), the redirect URI
 is derived from the origin the browser actually uses — browsing the dashboard
@@ -62,16 +63,17 @@ at `<web>` sends `<web>/api/auth/google/callback`, hitting the API directly
 sends `<api>/…`. PKCE (S256) + `nonce` + session-bound state are always on.
 
 Slack follows the same rule: **OAuth & Permissions → Redirect URLs** →
-`https://<web>.onrender.com/api/integrations/slack/callback` (and local).
+`https://reachinbox-web-kugh.onrender.com/api/integrations/slack/callback`
+(and local).
 
 ## 3. First-run checklist
 
-1. `GET https://<api>.onrender.com/api/health` → `ok:true`, `googleConfigured:true`.
-2. Open `https://<web>.onrender.com` → **Login with Google** → consent → dashboard.
+1. `GET https://reachinbox-api-1187.onrender.com/api/health` → `ok:true`, `googleConfigured:true`.
+2. Open https://reachinbox-web-kugh.onrender.com → **Login with Google** → consent → dashboard.
 3. Compose → 2 recipients → schedule → watch **Sent** fill up (Ethereal SMTP;
    view messages at https://ethereal.email with the seeded sender credentials —
    `pnpm db:verify:senders` prints them locally).
-4. **Bull Board**: `https://<web>.onrender.com/admin/queues` (auth-gated).
+4. **Bull Board**: https://reachinbox-web-kugh.onrender.com/admin/queues (auth-gated).
 5. Search: the dashboard search box queries ES when enabled, Postgres otherwise —
    identical results either way.
 
