@@ -1,59 +1,18 @@
 import { createHash, randomBytes } from "node:crypto";
 import { OAuth2Client } from "google-auth-library";
-import type { Request } from "express";
 import { getConfig } from "@reachinbox/config";
+import { redirectUriFor, expectedUrisFor } from "../../oauthRedirect.js";
 
 export const GOOGLE_CALLBACK_PATH = "/api/auth/google/callback";
 
-/**
- * The browser-facing origin (proxy-aware): the origin the user's browser
- * actually sees. The dashboard browses at :3000 and the Next.js rewrite proxy
- * forwards X-Forwarded-Host/X-Forwarded-Proto, so the OAuth redirect_uri must
- * be derived from THAT origin — a hardcoded :3001 URI is exactly what caused
- * Google's `Error 400: redirect_uri_mismatch` when the app is used via :3000.
- */
-export function browserOrigin(req: Request): string {
-  const proto =
-    (req.headers["x-forwarded-proto"] as string | undefined)?.split(",")[0]?.trim() ??
-    (req.secure ? "https" : "http");
-  const host =
-    (req.headers["x-forwarded-host"] as string | undefined)?.split(",")[0]?.trim() ??
-    req.headers.host ??
-    "localhost:3001";
-  return `${proto}://${host}`;
-}
-
-/**
- * Exact redirect_uri for this request. An explicitly configured
- * GOOGLE_REDIRECT_URI always wins (fixed public deployments); otherwise it is
- * derived from the browsing origin so local use works identically via the
- * :3000 dashboard proxy and the :3001 API directly.
- */
-export function googleRedirectUri(req: Request): string {
-  const cfg = getConfig();
-  return cfg.GOOGLE_REDIRECT_URI || `${browserOrigin(req)}${GOOGLE_CALLBACK_PATH}`;
+/** Exact redirect_uri for this request — policy lives in apps/api/src/oauthRedirect.ts. */
+export function googleRedirectUri(req: Parameters<typeof redirectUriFor>[0]): string {
+  return redirectUriFor(req, GOOGLE_CALLBACK_PATH, getConfig().GOOGLE_REDIRECT_URI);
 }
 
 /** URIs that must be registered as Authorized redirect URIs in Google Cloud Console. */
 export function expectedRedirectUris(): string[] {
-  const cfg = getConfig();
-  if (cfg.GOOGLE_REDIRECT_URI) return [cfg.GOOGLE_REDIRECT_URI];
-
-  // The deployed flow derives redirect_uri per request from the browsing
-  // origin, so the URIs that MUST be registered are the real ones this
-  // deployment can actually send — not just localhost:
-  //   - RENDER_EXTERNAL_URL: Render injects it into every web service; the
-  //     callback when the API is browsed directly.
-  //   - WEB_URL: the dashboard origin; the callback when login starts through
-  //     the dashboard's /api proxy (the normal user path).
-  // Plus the two local development origins.
-  const uris = new Set<string>();
-  const externalUrl = process.env.RENDER_EXTERNAL_URL;
-  if (externalUrl) uris.add(`${externalUrl}${GOOGLE_CALLBACK_PATH}`);
-  if (/^https?:\/\//.test(cfg.WEB_URL)) uris.add(`${cfg.WEB_URL}${GOOGLE_CALLBACK_PATH}`);
-  uris.add(`http://localhost:3000${GOOGLE_CALLBACK_PATH}`);
-  uris.add(`http://localhost:3001${GOOGLE_CALLBACK_PATH}`);
-  return [...uris];
+  return expectedUrisFor(GOOGLE_CALLBACK_PATH, getConfig().GOOGLE_REDIRECT_URI);
 }
 
 export function isGoogleConfigured(): boolean {

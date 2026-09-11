@@ -254,9 +254,10 @@ Cap resolution, most specific wins — all enforced atomically across **all** ap
 ## Verification
 
 ```bash
-pnpm test                # unit: recipients parser, backoff ladder, rate-window keys,
-                         # SMTP taxonomy, deterministic jobId
-node scripts/e2e.mjs     # 26-check E2E against the real local stack (API + worker running)
+pnpm test                  # unit: recipients parser, backoff ladder, rate-window keys,
+                           # SMTP taxonomy, deterministic jobId, OAuth redirect policy
+node scripts/e2e.mjs       # 26-check E2E against the real local stack (API + worker running)
+node scripts/e2e-oauth.mjs # 26-check OAuth harness: Google + Slack flows over real HTTP
 ```
 
 The E2E harness exercises, in order:

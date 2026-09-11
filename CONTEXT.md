@@ -36,6 +36,13 @@ packages/
 apps/
   api/            HTTP module: routes parse/validate/respond; services own SQL;
                   session/auth middleware. Thin process adapter in server.ts.
+                  OAuth redirect-URI policy lives in ONE place: src/oauthRedirect.ts
+                  (browserOrigin adapter + pure redirectUriFor/expectedUrisFor).
+                  Google (modules/auth) and Slack (modules/integrations/slack) add
+                  only their callback path + env override on top of it. The health
+                  endpoint's googleRedirectUris uses the same policy, so the URIs it
+                  tells you to register can never drift from what the flow sends.
+                  RENDER_EXTERNAL_URL (Render-injected) is part of the derived set.
   worker/         Send engine (processors/sendWorker.ts — I/O only: SQL, lease,
                   transport) + index/reindex processors + mailer + slack notify.
                   workers.ts owns BullMQ lifecycle; index.ts is the process wrapper.
@@ -53,6 +60,11 @@ Rules the structure keeps:
 - **Policy is pure**: `packages/queues/src/sendPolicy.ts` answers retry/defer/fail +
   delay (`nextAction`); the send engine executes the answer; BullMQ's backoff derives
   from the same module (`retryDelayForAttempt`). Change the ladder in one place.
+  Same pattern for OAuth: `apps/api/src/oauthRedirect.ts` answers "which redirect_uri
+  does this request send" and "which URIs must be registered" from the same inputs.
+- **Config is the only env reader**: modules read `getConfig()` — never
+  `process.env` directly (the RENDER_EXTERNAL_URL read that used to bypass this
+  lives in the config schema now).
 - **Apps are adapters**: `apps/worker/src/index.ts` and `apps/api/src/server.ts` are
   thin process wrappers (signals, listen). The engine and its lifecycle
   (`startWorkers`) are imported as a module — in-process mode (`WORKER_INPROCESS=true`)
@@ -88,9 +100,26 @@ Rules the structure keeps:
   reporter); `scripts/e2e-cloud.mjs` (full, includes SMTP delivery) and
   `scripts/e2e-cloud-nosmtp.mjs` (outage mode) keep only their scenarios.
   Don't copy harness mechanics — extend the shared module.
+- Harness primitives live in `scripts/lib/`: `reporter.mjs` (PASS/FAIL/summary,
+  one owner), `oauthHarness.mjs` (header-keeping fetch, cookie/PKCE parsing,
+  pg bridge to whatever DATABASE_URL points at). `scripts/e2e-oauth.mjs` drives
+  BOTH OAuth flows end-to-end (Google + Slack: authorize redirect, session
+  binding, denial round-trips, replay rejection, graceful-absence paths) —
+  it found the denial-path state-replay hole, so run it after auth changes.
 
 - `pnpm -r typecheck` — strict TS across the workspace.
 - `pnpm -r test` — node:test suites (queues compile to dist first: `pnpm --filter @reachinbox/queues build`).
+- OAuth denial semantics: the Google callback clears the single-use bind
+  (state/nonce/verifier/redirect_uri) on the `?error=` path too — a denial URL
+  must never be replayable with a forged `?code=`. `e2e-oauth.mjs` asserts this.
 - Real run: `docker compose up`-equivalent Redis + `DATABASE_URL`, then
   `pnpm dev:api` boots the API (health at `/api/health`) and runs the reconciler;
   `WORKER_INPROCESS=true` boots the send/index/reindex workers in the same process.
+- All-local full-suite topology (this machine): docker Postgres is mapped to
+  `POSTGRES_PORT` (5433 — a native Windows Postgres owns 5432), so run the API
+  with `DATABASE_URL=postgresql://reachinbox:reachinbox@localhost:5433/reachinbox
+  WORKER_INPROCESS=true ELASTICSEARCH_URL=http://localhost:9200` and pass the
+  same DATABASE_URL to `e2e-oauth.mjs`. `e2e.mjs` asserts the ES-backed reads
+  with bounded waits — ES indexing is async by design (index queue + drift
+  pass), never asserted instant. Ethereal 587 banners (2525 still out), so the
+  send path is verified for real in this topology.

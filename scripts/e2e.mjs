@@ -199,10 +199,20 @@ async function main() {
   assert(parseInt(deferred, 10) >= 1, "deferred rows: no attempts burned, no error, pushed to next window", `rows=${deferred}`);
 
   console.log("== 9. Query APIs: lists, search, detail, nav-counts (FR-27–29, FR-31–32)");
-  const sent = await api("/api/emails/sent?pageSize=100", { cookie });
-  assert(sent.status === 200 && sent.json?.items?.filter((i) => i.batchId === batchA)?.length === 4, "sent list shows batch A", `total=${sent.json?.total}`);
-  const search = await api(`/api/emails/sent?q=${encodeURIComponent(markerA)}`, { cookie });
-  assert(search.status === 200 && search.json?.items?.length === 4, "Elasticsearch search by subject marker", `hits=${search.json?.items?.length}`);
+  // ES indexing is async by design (index-queue dual-write + drift pass), so
+  // wait — bounded — for the read model to converge before asserting on it.
+  let sent;
+  await waitFor("sent list to show batch A (ES convergence)", async () => {
+    sent = await api("/api/emails/sent?pageSize=100", { cookie });
+    return sent.status === 200 && sent.json?.items?.filter((i) => i.batchId === batchA)?.length === 4;
+  }, { timeoutMs: 45_000, intervalMs: 1500 });
+  assert(sent.json?.items?.filter((i) => i.batchId === batchA)?.length === 4, "sent list shows batch A", `total=${sent.json?.total}`);
+  let search;
+  await waitFor("marker search to return all 4 (ES convergence)", async () => {
+    search = await api(`/api/emails/sent?q=${encodeURIComponent(markerA)}`, { cookie });
+    return search.status === 200 && search.json?.items?.length === 4;
+  }, { timeoutMs: 45_000, intervalMs: 1500 });
+  assert(search.json?.items?.length === 4, "Elasticsearch search by subject marker", `hits=${search.json?.items?.length}`);
   const searchRecipient = await api("/api/emails/sent?q=alice%2B1%40example.com", { cookie });
   assert(searchRecipient.json?.items?.some((i) => i.batchId === batchA), "search by recipient hits too");
   // 3 deferred rows exist but other scheduled rows may also fill the list.

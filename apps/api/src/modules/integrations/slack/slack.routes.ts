@@ -2,7 +2,7 @@ import { Router, type Request, type Response, type NextFunction } from "express"
 import { randomBytes } from "node:crypto";
 import { requireAuth, type AuthedRequest } from "../../../middleware/requireAuth.js";
 import { getConfig } from "@reachinbox/config";
-import { browserOrigin } from "../../auth/googleOauth.js";
+import { redirectUriFor } from "../../../oauthRedirect.js";
 import {
   buildSlackAuthorizeUrl,
   exchangeSlackCode,
@@ -22,10 +22,9 @@ interface OauthSession {
   slackRedirectUri?: string;
 }
 
-/** Explicit SLACK_REDIRECT_URI wins; otherwise derive from the browsing origin. */
-function slackRedirectUri(req: Request): string {
-  const cfg = getConfig();
-  return cfg.SLACK_REDIRECT_URI || `${browserOrigin(req)}${SLACK_CALLBACK_PATH}`;
+/** Explicit SLACK_REDIRECT_URI wins; otherwise derive from the browsing origin — shared policy. */
+function slackRedirectUri(req: Parameters<typeof redirectUriFor>[0]): string {
+  return redirectUriFor(req, SLACK_CALLBACK_PATH, getConfig().SLACK_REDIRECT_URI);
 }
 
 // GET /api/integrations/slack/connect → 302 into Slack's OAuth consent (FR-22).

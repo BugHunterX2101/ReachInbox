@@ -77,7 +77,14 @@ authRouter.get("/google/callback", async (req: Request, res: Response, next: Nex
     const googleError = req.query["error"] as string | undefined;
     if (googleError) {
       const desc = req.query["error_description"] as string | undefined;
-      authErrorRedirect(res, googleError, desc);
+      // Denial still consumed this flow's single-use bind — clear all of it
+      // (and persist!) so the state in the denial URL cannot be replayed with
+      // a forged ?code= afterwards.
+      session.oauthState = undefined;
+      session.oauthVerifier = undefined;
+      session.oauthNonce = undefined;
+      session.oauthRedirectUri = undefined;
+      req.session.save(() => authErrorRedirect(res, googleError, desc));
       return;
     }
 

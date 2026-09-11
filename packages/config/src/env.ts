@@ -63,6 +63,9 @@ const envSchema = z.object({
   // --- Services ---
   PORT: intSchema(3001),
   WEB_URL: z.string().default("http://localhost:3000"),
+  // Injected by Render into every web service. Empty locally. Part of the
+  // OAuth redirect-URI policy (see apps/api/src/oauthRedirect.ts).
+  RENDER_EXTERNAL_URL: z.string().default(""),
   SESSION_SECRET: z.string().min(16, "SESSION_SECRET must be at least 16 chars"),
   ENCRYPTION_KEY: z.string().length(64, "ENCRYPTION_KEY must be 64 hex chars"),
   COOKIE_SECURE: z
