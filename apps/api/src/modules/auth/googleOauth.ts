@@ -38,10 +38,22 @@ export function googleRedirectUri(req: Request): string {
 export function expectedRedirectUris(): string[] {
   const cfg = getConfig();
   if (cfg.GOOGLE_REDIRECT_URI) return [cfg.GOOGLE_REDIRECT_URI];
-  return [
-    "http://localhost:3000/api/auth/google/callback",
-    "http://localhost:3001/api/auth/google/callback",
-  ];
+
+  // The deployed flow derives redirect_uri per request from the browsing
+  // origin, so the URIs that MUST be registered are the real ones this
+  // deployment can actually send — not just localhost:
+  //   - RENDER_EXTERNAL_URL: Render injects it into every web service; the
+  //     callback when the API is browsed directly.
+  //   - WEB_URL: the dashboard origin; the callback when login starts through
+  //     the dashboard's /api proxy (the normal user path).
+  // Plus the two local development origins.
+  const uris = new Set<string>();
+  const externalUrl = process.env.RENDER_EXTERNAL_URL;
+  if (externalUrl) uris.add(`${externalUrl}${GOOGLE_CALLBACK_PATH}`);
+  if (/^https?:\/\//.test(cfg.WEB_URL)) uris.add(`${cfg.WEB_URL}${GOOGLE_CALLBACK_PATH}`);
+  uris.add(`http://localhost:3000${GOOGLE_CALLBACK_PATH}`);
+  uris.add(`http://localhost:3001${GOOGLE_CALLBACK_PATH}`);
+  return [...uris];
 }
 
 export function isGoogleConfigured(): boolean {
