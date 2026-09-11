@@ -88,7 +88,29 @@ node scripts/render-deploy.mjs verify    # health + OAuth URIs to register
 node scripts/e2e-cloud.mjs               # full end-to-end pass (needs E2E_CLOUD_API)
 ```
 
-## 4. Legacy: running the split topology anywhere
+## 4. Known issue: SMTP egress from Render free instances
+
+Render blocks outbound ports **25, 465, 587** on free web services (platform
+policy). The deployment therefore seeds Ethereal senders on port **2525**
+(the sanctioned alternate submission port), which delivered real mail in the
+full cloud E2E on 2026-09-09.
+
+As of 2026-09-11 `smtp.ethereal.email:2525` accepts TCP but never sends its
+220 banner (reproduced from two independent networks, while 587/25 on the
+same host banner instantly) — an upstream Ethereal outage. Combined with the
+Render port block, free instances currently cannot deliver until Ethereal's
+2525 recovers. The engine behaves correctly meanwhile: transient failures
+climb the retry ladder, rows end `failed` (or defer to the next hour window
+under a rate cap), and the reconciler re-enqueues missed work after restarts.
+
+- Verify the non-SMTP surface during an outage: `scripts/e2e-cloud-nosmtp.mjs`
+- Probe SMTP reachability + credentials: `DATABASE_URL=… ENCRYPTION_KEY=… node scripts/smtp-probe.mjs`
+- For guaranteed delivery: upgrade the API service to a paid compute plan
+  (unblocks 587) or swap the transport for an HTTP email API (no SMTP ports
+  involved) — the worker depends only on the `MailTransport` interface, so
+  this is one module (`apps/worker/src/mailer/`).
+
+## 5. Legacy: running the split topology anywhere
 
 Any host pairs fine with the classic layout (API and `apps/worker` as separate
 long-lived processes; leave `WORKER_INPROCESS` unset). The worker needs the

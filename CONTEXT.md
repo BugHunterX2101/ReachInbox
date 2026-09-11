@@ -67,6 +67,20 @@ Rules the structure keeps:
   - `rateLimitBreachMessage` reads env defaults at format time (kept — notify is the
     Slack concern's only cfg touch).
 
+## Deployed topology (Render, 2026-09-11)
+
+- `reachinbox-api` (free web service, `WORKER_INPROCESS=true`) + `reachinbox-web`
+  (Next.js) + `reachinbox-kv` (Render Key Value) + external **Neon** Postgres.
+- Deployed via `scripts/render-deploy.mjs` (stores → services → env); secrets
+  come from the local `.env` through `DEPLOY_FROM_ENV=1`, never from git.
+- Session auth runs against Neon (sessions table), Redis holds only BullMQ
+  state + rate counters. The API builds without the web app (`--filter=!@reachinbox/web`)
+  to fit the free tier's 512MB.
+- Known issue (see DEPLOY.md §4): SMTP egress from free instances is blocked
+  on 25/465/587 and Ethereal's 2525 was mid-outage at deploy time — all
+  non-SMTP surfaces verified green via `scripts/e2e-cloud-nosmtp.mjs` (14/14);
+  the full send path was verified locally end-to-end with real Ethereal SMTP.
+
 ## Verification story (what later passes must keep green)
 
 - `pnpm -r typecheck` — strict TS across the workspace.
