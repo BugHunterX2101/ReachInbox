@@ -4,12 +4,12 @@ import {
   EMAIL_SEND_QUEUE,
   EMAIL_INDEX_QUEUE,
   REINDEX_QUEUE,
-  getBlockingConnection,
   getQueueConnection,
   closeRedis,
-  backoffStrategy,
   runReconciler,
   getReindexQueue,
+  nextAction,
+  retryDelayForAttempt,
 } from "@reachinbox/queues";
 import { ensureEmailJobsIndex, isSearchEnabled } from "@reachinbox/search";
 import { processSendJob } from "./processors/sendWorker.js";
@@ -25,11 +25,16 @@ export interface RunningWorkers {
  * FR-7). Runs as a standalone long-lived process (`pnpm start` in apps/worker)
  * or in-process inside the API when WORKER_INPROCESS=true — same processors,
  * one implementation, no duplicated logic.
+ *
+ * Retry policy (§6.4) is decided by the pure send-policy module: the send
+ * engine asks nextAction(); BullMQ's backoff derives its delay from the same
+ * module via retryDelayForAttempt.
  */
 export async function startWorkers(): Promise<RunningWorkers> {
   const cfg = getConfig();
+  const inProcess = process.env.WORKER_INPROCESS === "true";
   console.log("[worker] starting", {
-    mode: "in-process",
+    mode: inProcess ? "in-process" : "standalone",
     concurrency: cfg.WORKER_CONCURRENCY,
     retryMaxAttempts: cfg.RETRY_MAX_ATTEMPTS,
     leaseTimeoutMs: cfg.RECONCILE_LEASE_TIMEOUT_MS,
@@ -51,12 +56,12 @@ export async function startWorkers(): Promise<RunningWorkers> {
     EMAIL_SEND_QUEUE,
     async (job, token) => processSendJob(job, token),
     {
-      connection: getBlockingConnection(),
+      connection: getQueueConnection(),
       prefix: cfg.QUEUE_PREFIX,
       concurrency: cfg.WORKER_CONCURRENCY, // FR-16 — env-driven
       settings: {
-        // Custom backoff ladder (§6.4): 30s → 60s → 120s ± jitter.
-        backoffStrategy: (attemptsMade: number) => backoffStrategy(attemptsMade),
+        // Same ladder the engine consults on failure (§6.4): 30s → 60s → 120s ± jitter.
+        backoffStrategy: (attemptsMade: number) => retryDelayForAttempt(attemptsMade),
       },
     }
   );
@@ -66,7 +71,7 @@ export async function startWorkers(): Promise<RunningWorkers> {
     EMAIL_INDEX_QUEUE,
     async (job) => processIndexJob((job.data as { emailJobId: string }).emailJobId),
     {
-      connection: getBlockingConnection(),
+      connection: getQueueConnection(),
       prefix: cfg.QUEUE_PREFIX,
       concurrency: 5,
       settings: {
@@ -84,7 +89,7 @@ export async function startWorkers(): Promise<RunningWorkers> {
       return r;
     },
     {
-      connection: getBlockingConnection(),
+      connection: getQueueConnection(),
       prefix: cfg.QUEUE_PREFIX,
       concurrency: 1,
     }

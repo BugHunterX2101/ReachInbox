@@ -1,5 +1,5 @@
 import { createApp } from "./app.js";
-import { runBootReconciler } from "./reconciler/bootReconciler.js";
+import { runReconciler } from "@reachinbox/queues";
 import { getConfig } from "@reachinbox/config";
 import type { RunningWorkers } from "@reachinbox/worker/workers";
 
@@ -8,8 +8,9 @@ async function main(): Promise<void> {
   const { app } = createApp();
 
   // FR-9/FR-11: reconcile DB intent against Redis on every process start.
+  // (Shared implementation with the worker — no API-side shim.)
   try {
-    await runBootReconciler();
+    await runReconciler();
   } catch (err) {
     // Never block startup on reconciliation — the maintenance job will catch up.
     console.error("[server] boot reconciler failed (will retry via maintenance):", err);

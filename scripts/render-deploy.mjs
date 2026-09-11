@@ -2,8 +2,8 @@
  * Render deployment orchestrator — idempotent + resumable.
  *
  * Usage:
- *   RENDER_API_KEY=rnd_xxx node scripts/render-deploy.mjs stores    # ensure PG + KV, wait ready
- *   RENDER_API_KEY=rnd_xxx node scripts/render-deploy.mjs services  # ensure both services, wait live
+ *   DEPLOY_FROM_ENV=1 RENDER_API_KEY=rnd_xxx node scripts/render-deploy.mjs stores    # ensure KV (+optional PG), wait ready
+ *   DEPLOY_FROM_ENV=1 RENDER_API_KEY=rnd_xxx node scripts/render-deploy.mjs services  # ensure both services (Neon DATABASE_URL from .env), wait live
  *   RENDER_API_KEY=rnd_xxx node scripts/render-deploy.mjs verify    # hit /api/health, print OAuth URIs
  *   RENDER_API_KEY=rnd_xxx node scripts/render-deploy.mjs status    # one-line state of all resources
  *
@@ -133,11 +133,16 @@ if (process.env.DEPLOY_FROM_ENV === "1") {
   process.env.DEPLOY_GOOGLE_CLIENT_SECRET ??= readEnv("GOOGLE_CLIENT_SECRET");
   process.env.DEPLOY_SESSION_SECRET ??= readEnv("SESSION_SECRET");
   process.env.DEPLOY_ENCRYPTION_KEY ??= readEnv("ENCRYPTION_KEY");
+  process.env.DEPLOY_SLACK_CLIENT_ID ??= readEnv("SLACK_CLIENT_ID");
+  process.env.DEPLOY_SLACK_CLIENT_SECRET ??= readEnv("SLACK_CLIENT_SECRET");
+  process.env.DEPLOY_DATABASE_URL ??= readEnv("DATABASE_URL");
 }
 const ENCRYPTION_KEY = process.env.DEPLOY_ENCRYPTION_KEY;
 const GOOGLE_CLIENT_ID = process.env.DEPLOY_GOOGLE_CLIENT_ID;
 const GOOGLE_CLIENT_SECRET = process.env.DEPLOY_GOOGLE_CLIENT_SECRET;
 const SESSION_SECRET = process.env.DEPLOY_SESSION_SECRET;
+const SLACK_CLIENT_ID = process.env.DEPLOY_SLACK_CLIENT_ID;
+const SLACK_CLIENT_SECRET = process.env.DEPLOY_SLACK_CLIENT_SECRET;
 
 const API_SERVICE_ENV = [
   { key: "NODE_VERSION", value: "22" }, // pnpm 11 requires node:sqlite (Node ≥22.13)
@@ -148,6 +153,8 @@ const API_SERVICE_ENV = [
   { key: "ENCRYPTION_KEY", value: ENCRYPTION_KEY },
   { key: "GOOGLE_CLIENT_ID", value: GOOGLE_CLIENT_ID },
   { key: "GOOGLE_CLIENT_SECRET", value: GOOGLE_CLIENT_SECRET },
+  { key: "SLACK_CLIENT_ID", value: SLACK_CLIENT_ID },
+  { key: "SLACK_CLIENT_SECRET", value: SLACK_CLIENT_SECRET },
 ];
 
 function webServiceEnv(apiUrl, webUrl) {
@@ -173,7 +180,7 @@ function apiServiceBody(envVars) {
       plan: "free",
       region: REGION,
       envSpecificDetails: {
-        buildCommand: "corepack enable && pnpm install && pnpm -r build",
+        buildCommand: "npx --yes pnpm@11.10.0 install --frozen-lockfile && npx --yes pnpm@11.10.0 --filter=!@reachinbox/web build",
         startCommand: "sh infra/render/boot-setup.sh && node apps/api/dist/server.js",
       },
       preDeployCommand: "sh infra/render/predeploy.sh",
@@ -198,7 +205,7 @@ function webServiceBody(envVars) {
       region: REGION,
       envSpecificDetails: {
         buildCommand:
-          "corepack enable && pnpm install && pnpm --filter @reachinbox/shared-types build && pnpm --filter @reachinbox/web build",
+          "npx --yes pnpm@11.10.0 install --frozen-lockfile && npx --yes pnpm@11.10.0 --filter @reachinbox/shared-types build && npx --yes pnpm@11.10.0 --filter @reachinbox/web build",
         startCommand: "pnpm --filter @reachinbox/web start",
       },
       healthCheckPath: "/",
@@ -212,13 +219,17 @@ async function ensureServices() {
     throw new Error("set DEPLOY_ENCRYPTION_KEY, DEPLOY_GOOGLE_CLIENT_ID, DEPLOY_GOOGLE_CLIENT_SECRET, DEPLOY_SESSION_SECRET (or DEPLOY_FROM_ENV=1 with a local .env)");
   }
   const state = loadState();
-  if (!state.pgId || !state.kvId) throw new Error("run the `stores` phase first");
-
-  const pgConn = await api("GET", `/postgres/${state.pgId}/connection-info`);
+  // Postgres is external Neon (render.yaml policy): DEPLOY_DATABASE_URL wins;
+  // fall back to a Render-managed PG only when one was provisioned by `stores`.
+  let databaseUrl = process.env.DEPLOY_DATABASE_URL;
+  if (!databaseUrl) {
+    if (!state.pgId) throw new Error("set DEPLOY_DATABASE_URL (Neon) or run the `stores` phase");
+    const pgConn = await api("GET", `/postgres/${state.pgId}/connection-info`);
+    databaseUrl = pgConn.internalConnectionString;
+  }
   const kvConn = await api("GET", `/redis/${state.kvId}/connection-info`);
-  const databaseUrl = pgConn.internalConnectionString;
   const redisUrl = kvConn.internalConnectionString;
-  console.log("got store connection strings (internal)");
+  console.log("got store connection strings");
 
   const services = await listAll("/services?limit=100", "services");
   const existing = new Map(services.map((s) => [s.name, s]));
@@ -270,12 +281,17 @@ async function fixEnv() {
   const state = loadState();
   if (!state.apiId || !state.webId || !state.apiUrl || !state.webUrl) throw new Error("run `services` first");
 
-  const pgConn = await api("GET", `/postgres/${state.pgId}/connection-info`);
+  let databaseUrl = process.env.DEPLOY_DATABASE_URL;
+  if (!databaseUrl) {
+    if (!state.pgId) throw new Error("set DEPLOY_DATABASE_URL (Neon) or run the `stores` phase");
+    const pgConn = await api("GET", `/postgres/${state.pgId}/connection-info`);
+    databaseUrl = pgConn.internalConnectionString;
+  }
   const kvConn = await api("GET", `/redis/${state.kvId}/connection-info`);
 
   const apiEnv = [
     ...API_SERVICE_ENV,
-    { key: "DATABASE_URL", value: pgConn.internalConnectionString },
+    { key: "DATABASE_URL", value: databaseUrl },
     { key: "REDIS_URL", value: kvConn.internalConnectionString },
     { key: "SESSION_SECRET", value: SESSION_SECRET },
     { key: "WEB_URL", value: state.webUrl },

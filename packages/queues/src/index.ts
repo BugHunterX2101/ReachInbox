@@ -5,6 +5,7 @@ import { getConfig, retryLadderMs } from "@reachinbox/config";
 
 export { getConfig, retryLadderMs } from "@reachinbox/config";
 import { computeBackoffMs } from "./backoff.js";
+import { retryDelayForAttempt } from "./sendPolicy.js";
 import { classifySmtpFailure, extractSmtpCode } from "./smtpErrors.js";
 
 export { computeBackoffMs, hasAttemptsLeft } from "./backoff.js";
@@ -19,6 +20,7 @@ export {
 } from "./rateLimiter.js";
 export { runReconciler, type ReconcileResult } from "./reconciler.js";
 export { expandBatch, reconcileScheduledJobs, getQueueCounts } from "./scheduler.js";
+export { nextAction, retryDelayForAttempt, type SendNextAction, type SendNextActionInput } from "./sendPolicy.js";
 
 export const EMAIL_SEND_QUEUE = "email-send";
 export const EMAIL_INDEX_QUEUE = "email-index";
@@ -48,7 +50,10 @@ export function getQueueConnection(): Redis {
   return connection;
 }
 
-/** Blocking connection for workers (kept separate from producer connection). */
+/**
+ * Blocking connection for workers (kept separate from the producer connection
+ * so a slow non-blocking command never delays BZPOPMIN).
+ */
 export function getBlockingConnection(): Redis {
   if (!blockingConnection) {
     const cfg = getConfig();
@@ -65,7 +70,10 @@ export async function closeRedis(): Promise<void> {
 }
 
 let emailSendQueueSingleton: Queue<EmailSendJobData> | null = null;
+let emailIndexQueueSingleton: Queue<EmailIndexJobData> | null = null;
+let reindexQueueSingleton: Queue<ReindexJobData> | null = null;
 
+/** All queue construction is singleton: one owner of queue state per process. */
 export function getEmailSendQueue(): Queue<EmailSendJobData> {
   if (!emailSendQueueSingleton) {
     const cfg = getConfig();
@@ -78,25 +86,34 @@ export function getEmailSendQueue(): Queue<EmailSendJobData> {
 }
 
 export function getEmailIndexQueue(): Queue<EmailIndexJobData> {
-  const cfg = getConfig();
-  return new Queue<EmailIndexJobData>(EMAIL_INDEX_QUEUE, {
-    connection: getQueueConnection(),
-    prefix: cfg.QUEUE_PREFIX,
-  });
+  if (!emailIndexQueueSingleton) {
+    const cfg = getConfig();
+    emailIndexQueueSingleton = new Queue<EmailIndexJobData>(EMAIL_INDEX_QUEUE, {
+      connection: getQueueConnection(),
+      prefix: cfg.QUEUE_PREFIX,
+    });
+  }
+  return emailIndexQueueSingleton;
 }
 
 export function getReindexQueue(): Queue<ReindexJobData> {
-  const cfg = getConfig();
-  return new Queue<ReindexJobData>(REINDEX_QUEUE, {
-    connection: getQueueConnection(),
-    prefix: cfg.QUEUE_PREFIX,
-  });
+  if (!reindexQueueSingleton) {
+    const cfg = getConfig();
+    reindexQueueSingleton = new Queue<ReindexJobData>(REINDEX_QUEUE, {
+      connection: getQueueConnection(),
+      prefix: cfg.QUEUE_PREFIX,
+    });
+  }
+  return reindexQueueSingleton;
 }
 
-/** Custom BullMQ backoff strategy (§6.4) — single source of retry policy. */
+/**
+ * BullMQ custom backoff strategy (§6.4) — single source of retry policy.
+ * Derived from the send-policy module: the send engine asks nextAction() and
+ * BullMQ schedules with the same ladder via retryDelayForAttempt.
+ */
 export function backoffStrategy(attemptsMade: number): number {
-  const cfg = getConfig();
-  return computeBackoffMs(attemptsMade, retryLadderMs(cfg), cfg.RETRY_JITTER_PCT);
+  return retryDelayForAttempt(attemptsMade);
 }
 
 const SEND_JOB_OPTS = (delay: number, maxAttempts: number) =>

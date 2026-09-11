@@ -9,7 +9,7 @@ import {
   peekRateLimitCounters,
   getQueueConnection,
   enqueueEmailIndex,
-  classifySmtpFailure,
+  nextAction,
   type RateCounter,
 } from "@reachinbox/queues";
 import type { MailTransport } from "../mailer/etherealTransport.js";
@@ -34,8 +34,8 @@ function logTransition(entry: {
   batchId: string;
   tenantId: string;
   senderId: string;
-  fromStatus: string;
-  toStatus: string;
+  fromStatus: `processing` | `sent` | `failed` | `scheduled`;
+  toStatus: `processing` | `sent` | `failed` | `scheduled`;
   attempt: number;
   latencyMs: number;
 }): void {
@@ -59,6 +59,9 @@ interface JobRow extends DbEmailJob {
  * The lease (`locked_at`/`locked_by`) marks `processing`; every terminal or
  * rollback transition is guarded on the lease holder so a reclaimed lease can
  * never be overwritten by a zombie worker.
+ *
+ * Failure policy (retry/defer/fail) is NOT decided here: the engine executes
+ * the answer of the pure send-policy module (`nextAction`) and keeps only I/O.
  */
 export async function processSendJob(job: Job, token?: string): Promise<void> {
   const pool = getPool();
@@ -187,41 +190,44 @@ export async function processSendJob(job: Job, token?: string): Promise<void> {
       senderId: row.sender_id,
       fromStatus: "processing",
       toStatus: "sent",
-      attempt: job.attemptsMade + 1,
+      attempt: job.attemptsMade, // logged pre-increment
       latencyMs: Date.now() - started,
     });
     await enqueueEmailIndex(row.id);
   } catch (err) {
-    const cls = classifySmtpFailure(err);
-    if (cls.transient && job.attemptsMade + 1 < cfg.RETRY_MAX_ATTEMPTS) {
-      // Transient failure with attempts left: back to `scheduled`; BullMQ's
-      // custom backoff ladder (30s/60s/120s ±jitter) schedules the retry.
-      // Guarded on the lease so a row another worker already finished is untouched.
+    // ---- Failure policy: decided by the pure send-policy module (§6.4) ----
+    const action = nextAction({
+      failure: err,
+      attemptsMade: job.attemptsMade,
+      maxAttempts: cfg.RETRY_MAX_ATTEMPTS,
+    });
+
+    if (action.kind === "retry") {
+      // Back to `scheduled`; BullMQ's custom backoff (same ladder via
+      // retryDelayForAttempt) schedules the retry. Guarded on the lease so a
+      // row another worker already finished is untouched.
       await pool.query(
         `UPDATE email_jobs
          SET status = 'scheduled', locked_at = NULL, locked_by = NULL,
              attempts = $2, last_error = $3, updated_at = now()
          WHERE id = $1 AND status = 'processing' AND locked_by = $4`,
-        [row.id, job.attemptsMade + 1, (err as Error).message.slice(0, 500), WORKER_INSTANCE_ID]
+        [row.id, job.attemptsMade + 1, action.message.slice(0, 500), WORKER_INSTANCE_ID]
       );
       logTransition({
-        jobId: job.id ?? "",
+        jobId: action.message, // diagnostic: the classified failure text
         dbJobId: row.id,
         batchId: row.batch_id,
         tenantId: row.tenant_id,
         senderId: row.sender_id,
         fromStatus: "processing",
         toStatus: "scheduled",
-        attempt: job.attemptsMade + 1,
+        attempt: job.attemptsMade, // logged pre-increment
         latencyMs: Date.now() - started,
       });
-      throw err; // BullMQ catches → applies backoff → retry
+      throw err; // BullMQ catches → applies the same ladder → retry
     }
-    if (cls.transient) {
-      await discardAndFail(job, row, `max attempts exceeded: ${(err as Error).message}`);
-    } else {
-      await discardAndFail(job, row, `${cls.code ?? "SMTP"} permanent failure: ${(err as Error).message}`);
-    }
+
+    await discardAndFail(job, row, action.reason);
   } finally {
     transport.close();
   }
@@ -264,7 +270,7 @@ async function deferJob(
     senderId: row.sender_id,
     fromStatus: "processing",
     toStatus: "scheduled",
-    attempt: job.attemptsMade + 1,
+    attempt: job.attemptsMade, // logged pre-increment
     latencyMs: Date.now() - info.started,
   });
 

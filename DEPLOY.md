@@ -21,8 +21,11 @@ after 30 days — recreate it and the preDeploy command re-migrates and re-seeds
 2. Render Dashboard → **New → Blueprint** → select the repo → Render reads
    `render.yaml` (databases + both services + wiring).
 3. Fill the `sync: false` env vars when prompted:
-   - `ENCRYPTION_KEY` — `openssl rand -hex 32`
-   - `GOOGLE_CLIENT_ID` / `GOOGLE_CLIENT_SECRET` — from Google Cloud Console
+- `DATABASE_URL` — external Neon Postgres (no 30-day expiry). The `stores`
+  phase provisions only the Render Key Value; Postgres is never Render-managed.
+- `ENCRYPTION_KEY` — `openssl rand -hex 32` — **must match** the key that
+  encrypted the sender passwords already in the Neon DB
+- `GOOGLE_CLIENT_ID` / `GOOGLE_CLIENT_SECRET` — from Google Cloud Console
    - `WEB_URL` — the **web** service URL, e.g. `https://reachinbox-web.onrender.com`
    - `API_INTERNAL_URL` + `NEXT_PUBLIC_API_URL` (web service) — the **API**
      service URL, e.g. `https://reachinbox-api.onrender.com`
@@ -71,6 +74,19 @@ Slack follows the same rule: **OAuth & Permissions → Redirect URLs** →
 4. **Bull Board**: `https://<web>.onrender.com/admin/queues` (auth-gated).
 5. Search: the dashboard search box queries ES when enabled, Postgres otherwise —
    identical results either way.
+
+## 3b. Deploying via the API orchestrator
+
+`scripts/render-deploy.mjs` drives everything (idempotent, resumable):
+
+```sh
+set -a; source .env; set +a   # provides RENDER_API_KEY + deploy secrets
+node scripts/render-deploy.mjs stores    # ensure reachinbox-kv, wait ready
+node scripts/render-deploy.mjs services  # ensure reachinbox-api + reachinbox-web
+node scripts/render-deploy.mjs env       # fix cross-service URLs, redeploy
+node scripts/render-deploy.mjs verify    # health + OAuth URIs to register
+node scripts/e2e-cloud.mjs               # full end-to-end pass (needs E2E_CLOUD_API)
+```
 
 ## 4. Legacy: running the split topology anywhere
 
