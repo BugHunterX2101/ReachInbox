@@ -83,6 +83,12 @@ Rules the structure keeps:
 
 ## Verification story (what later passes must keep green)
 
+- Cloud harnesses share ONE plumbing module, `scripts/lib/cloudHarness.mjs`
+  (Neon psql bridge, deployed-API client, session bootstrap, batch polling,
+  reporter); `scripts/e2e-cloud.mjs` (full, includes SMTP delivery) and
+  `scripts/e2e-cloud-nosmtp.mjs` (outage mode) keep only their scenarios.
+  Don't copy harness mechanics — extend the shared module.
+
 - `pnpm -r typecheck` — strict TS across the workspace.
 - `pnpm -r test` — node:test suites (queues compile to dist first: `pnpm --filter @reachinbox/queues build`).
 - Real run: `docker compose up`-equivalent Redis + `DATABASE_URL`, then
