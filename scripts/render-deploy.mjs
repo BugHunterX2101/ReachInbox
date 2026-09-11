@@ -303,10 +303,13 @@ async function fixEnv() {
   console.log("web env vars set (API_INTERNAL_URL →", state.apiUrl + ")");
 
   // Env changes don't auto-deploy — trigger a fresh deploy on each service.
+  // Null body = a deploy is already in flight (auto-deploy) — that one already
+  // has the corrected env, so skip instead of crashing.
   for (const [id, label] of [[state.apiId, "api"], [state.webId, "web"]]) {
-    const d = await api("POST", `/services/${id}/deploys`, {});
-    const dep = d.deploy ?? d;
-    console.log(`triggered ${label} deploy:`, dep.id);
+    const d = await api("POST", `/services/${id}/deploys`, {}).catch(() => null);
+    const dep = d?.deploy ?? d;
+    if (dep?.id) console.log(`triggered ${label} deploy:`, dep.id);
+    else console.log(`${label}: deploy already in flight — it carries the corrected env`);
   }
 }
 
