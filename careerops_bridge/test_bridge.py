@@ -78,10 +78,11 @@ class CollectorTests(unittest.TestCase):
         self.temp.cleanup()
     def test_feed_to_detail_hold_only(self):
         first=FEED[3]
+        inventory=(FEED,adapters.APPROVED_FEEDS[6],adapters.APPROVED_FEEDS[2])
         html="<html><body>Graduate Software Engineer 2027 London, UK Full time September 2027 graduate start.</body></html>"
         def fake_json(url):
             return envelope([row()]) if url==first else envelope([])
-        with patch.object(server,"get_json",side_effect=fake_json),patch.object(server,"get_html",return_value=html),patch.object(server,"ollama_ready",return_value=False):
+        with patch.object(server,"SOURCE_INVENTORY",inventory),patch.object(server,"get_json",side_effect=fake_json),patch.object(server,"get_html",return_value=html),patch.object(server,"ollama_ready",return_value=False):
             a=server.collect(2)
             self.assertEqual(len(a["scans"]),2)
             self.assertEqual(len(a["items"]),1)
@@ -111,7 +112,7 @@ class CollectorTests(unittest.TestCase):
             result=server.collect(2)
         self.assertLessEqual(len(result["items"]),3)
         self.assertTrue(all(i["status"]=="HOLD" for i in result["items"]))
-        self.assertEqual(result["state"]["sources"],len(adapters.APPROVED_FEEDS)+len(server.PAGES))
+        self.assertEqual(result["state"]["sources"],len(server.SOURCE_INVENTORY))
 
 
 class AccessPolicyTests(unittest.TestCase):
@@ -154,6 +155,37 @@ class AccessPolicyTests(unittest.TestCase):
         with patch.dict(os.environ,{"ENABLE_LOCAL_SCRAPEGRAPHAI":"true","OLLAMA_BASE_URL":"https://external.example","OLLAMA_MODEL":"model"}):
             self.assertEqual(server.ollama_status(),"LOCAL_MODEL_CONFIG_INVALID")
 
+
+class SourceRotationTests(unittest.TestCase):
+    def test_distinct_hosts(self):
+        work,cursor=server.choose_work(server.SOURCE_INVENTORY,0,[],set(),2)
+        from urllib.parse import urlsplit
+        self.assertEqual(len(work),2)
+        self.assertNotEqual(urlsplit(work[0][0][3]).hostname,urlsplit(work[1][0][3]).hostname)
+
+    def test_skip_blocked_sources(self):
+        blocked={s[3] for s in server.SOURCE_INVENTORY[:4]}
+        work,cursor=server.choose_work(server.SOURCE_INVENTORY,0,[],blocked,2)
+        self.assertTrue(all(s[3] not in blocked for s,_ in work))
+
+    def test_all_blocked_no_attempt(self):
+        blocked={s[3] for s in server.SOURCE_INVENTORY}
+        self.assertEqual(server.choose_work(server.SOURCE_INVENTORY,0,[],blocked,2)[0],[])
+
+    def test_timeout_stage(self):
+        with patch.object(server.OPENER,"open",side_effect=TimeoutError()):
+            with self.assertRaisesRegex(TimeoutError,"ROBOTS_CONNECT_TIMEOUT"):
+                server._get_public("https://example.com/robots.txt","text/plain")
+            with self.assertRaisesRegex(TimeoutError,"ORIGIN_CONNECT_TIMEOUT"):
+                server._get_public("https://example.com/jobs","text/html")
+
+    def test_cooldown_persisted(self):
+        with tempfile.TemporaryDirectory() as d,patch.object(server,"DB_PATH",Path(d)/"test.sqlite"):
+            server.init_db()
+            with patch.object(server,"safe_scan",return_value=("BLOCKED",[])):
+                first=server.collect(2)
+                second=server.collect(2)
+            self.assertTrue({s["source"] for s in first["scans"]}.isdisjoint({s["source"] for s in second["scans"]}))
 
 if __name__ == "__main__":
     unittest.main()
