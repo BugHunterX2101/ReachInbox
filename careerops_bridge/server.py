@@ -256,7 +256,7 @@ def agent_reach_discovery():
             return {"status": "UNAVAILABLE", "checked_utc": checked, "items": 0, "code": "ORIGIN_EVIDENCE_MISSING"}
         job = jobs[0]
         record_scrapling_proof(job)
-        result = agent_read_verified(url, job["title"], timeout=12)
+        result = agent_read_verified(url, job["title"], timeout=25)
         if result.get("status") == "OK" and (company,url) != DIAGNOSTIC_ORIGIN[:2]:
             result["candidate"] = {k: job[k] for k in ("url", "company", "title", "location", "source_url")}
         result["checked_utc"] = timestamp()
