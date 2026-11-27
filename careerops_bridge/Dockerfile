@@ -27,7 +27,7 @@ COPY --from=ollama-cpu /usr/lib/ollama /usr/lib/ollama
 WORKDIR /app
 COPY requirements.txt ./
 RUN pip install -r requirements.txt && pip install uv
-RUN uv tool install https://github.com/Panniantong/Agent-Reach/releases/latest/download/agent-reach.zip
+RUN uv tool install https://github.com/Panniantong/Agent-Reach/releases/download/v1.6.1/agent-reach.zip
 RUN mkdir -p /opt/ollama/models && \
     (ollama serve >/tmp/ollama-build.log 2>&1 & echo $! >/tmp/ollama-build.pid) && \
     (for i in $(seq 1 40); do curl -fsS --max-time 1 http://127.0.0.1:11434/api/tags >/dev/null 2>&1 && break || sleep 1; done) && \
@@ -40,6 +40,7 @@ COPY model_probe.py ./model_probe.py
 COPY test_bridge.py ./test_bridge.py
 RUN python -m py_compile server.py bridge_adapters.py model_probe.py && python -m unittest -v test_bridge
 COPY start.sh ./start.sh
+RUN sh -n /app/start.sh
 RUN useradd -u 10001 -m careerops && \
     chown -R careerops:careerops /opt/ollama/models && \
     chmod +x /app/start.sh
