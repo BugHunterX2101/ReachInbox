@@ -36,6 +36,8 @@ PAGES = [
     ("ATOCONN", "https://www.atoconn.com/vacancies/intern-software-developer/"),
     ("Ubisar", "https://www.ubisar.com/vacancies/tech-intern"),
     ("Tecell", "https://careers.tecell.in/jobs/01a1ff0a-21e8-7e75-bb78-e17358385b66"),
+    ("Guruvai Sciences", "https://guruvaisciences.org/career/internship-opportunity-build-the-future-of-ai-with-guruvai-sciences"),
+    ("HyperBlox", "https://hyperblox.in/careers/"),
 ]
 # Start with distinct documented providers rather than two boards on the
 # same failing host. Retain all reviewed sources and the Europe/Canada priority.
@@ -241,12 +243,55 @@ def approved_detail(company, url):
     return any(company == c and posting_url(url, ats, board) == url for c, ats, board, _ in APPROVED_FEEDS)
 
 
+def reviewed_html_cards(html, source_url, company):
+    """Extract only observed fields on reviewed pages, never invent role permalinks."""
+    from scrapling import Selector
+    sel=Selector(html,url=source_url)
+    # A careers index with no unique role permalink may supply at most one
+    # unambiguous in-scope research hint. Its URL remains the real index URL.
+    if (company,source_url)==("HyperBlox","https://hyperblox.in/careers/"):
+        candidates=[]
+        for card in sel.css("div.rounded-xl.border.border-border.bg-card.p-6"):
+            heads=[clean(h.get_all_text(separator=" ",strip=True),220) for h in card.css("h3")]
+            locations=[clean(p.get_all_text(separator=" ",strip=True),200) for p in card.css("p")]
+            locations=[p for p in locations if re.fullmatch(r"Remote\s*\(India\)",p,re.I)]
+            body=clean(card.get_all_text(separator=" ",strip=True),16000)
+            if len(heads)!=1 or len(locations)!=1 or not re.search(r"\binternship\b",body,re.I):
+                continue
+            if re.search(r"\b(closed|expired|no longer accepting)\b",body,re.I):
+                continue
+            job={"url":source_url,"title":heads[0],"location":locations[0],"company":company,"source_url":source_url,"extraction":"scrapling:origin_visible_text","description":body}
+            if eligible_hint(job):
+                candidates.append(job)
+        return candidates if len(candidates)==1 else []
+    return []
+
+
 def detail_evidence(html, source_url, company, expected=None):
     """Actual Scrapling extraction, including a deterministic ATS-to-page corroboration."""
     out = parse_jobposting(html, source_url, company)
     out = [j for j in out if j.get("url") == source_url]
+    # Guruvai's reviewed JobPosting lacks jobLocation, but its actual role
+    # description has a literal Location label. Do not infer geography from
+    # the company, the URL, or a generic address in the footer.
+    if (company,source_url)==("Guruvai Sciences","https://guruvaisciences.org/career/internship-opportunity-build-the-future-of-ai-with-guruvai-sciences"):
+        from scrapling import Selector
+        sel=Selector(html,url=source_url)
+        matches=[]
+        for el in sel.css("span"):
+            t=clean(el.get_all_text(separator=" ",strip=True),250)
+            m=re.fullmatch(r"Location:\s*([^:]{2,180})",t,re.I)
+            if m and m.group(1).strip():
+                matches.append(m.group(1).strip())
+        locations=list(dict.fromkeys(matches))
+        if len(out)==1 and not out[0].get("location") and len(locations)==1:
+            out[0]["location"]=locations[0]
+            out[0]["extraction"]="scrapling:origin_visible_text"
     if out:
         return out
+    cards=reviewed_html_cards(html,source_url,company)
+    if cards:
+        return cards
     if (company, source_url)==("ATOCONN","https://www.atoconn.com/vacancies/intern-software-developer/"):
         from scrapling import Selector
         sel=Selector(html,url=source_url)
