@@ -21,7 +21,7 @@ from html import unescape
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlsplit
-from urllib.request import Request, build_opener, HTTPRedirectHandler
+from urllib.request import Request, build_opener, HTTPRedirectHandler, ProxyHandler
 from urllib.robotparser import RobotFileParser
 from urllib.error import HTTPError
 from bridge_adapters import (APPROVED_FEEDS, agent_read_verified, clean, eligible_hint as candidate_eligible,
@@ -47,6 +47,9 @@ class NoRedirect(HTTPRedirectHandler):
         return None
 
 OPENER = build_opener(NoRedirect())
+LOCAL_OPENER = build_opener(ProxyHandler({}), NoRedirect())
+# Diagnostic-only public employer posting; never enters discovery or outreach.
+DIAGNOSTIC_ORIGIN = ("Atlassian", "https://www.atlassian.com/company/careers/details/26070", {"title":"Software Engineer, 2027 Graduate Canada", "location":"Vancouver, British Columbia"})
 
 def timestamp():
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -85,14 +88,28 @@ def _get_public(url, accept, maximum=LIMIT_BYTES):
 def robots_check(url):
     u = urlsplit(url)
     robots_url = f"{u.scheme}://{u.netloc}/robots.txt"
-    raw, _ = _get_public(robots_url, "text/plain", maximum=80_000)
+    try:
+        raw, ctype = _get_public(robots_url, "text/plain", maximum=512_000)
+    except HTTPError as exc:
+        # RFC 9309 §2.3.1.3: a genuinely absent robots file is not a
+        # prohibition. Narrow this exception to documented public GET ATS
+        # feeds in the reviewed allowlist, never arbitrary HTML or blocked
+        # paths. 401/403/429/5xx/redirects/network failures remain fail-closed.
+        if exc.code in (404, 410) and url in {s[3] for s in APPROVED_FEEDS}:
+            print(json.dumps({"event":"robots_policy","source":url,"code":"PUBLIC_API_ROBOTS_ABSENT","http":exc.code}),flush=True)
+            return
+        raise PermissionError("ROBOTS_HTTP_" + str(exc.code)) from None
+    if not ctype.lower().startswith("text/plain"):
+        raise PermissionError("ROBOTS_CONTENT_TYPE")
     rp = RobotFileParser()
     rp.parse(raw.decode("utf-8", "replace").splitlines())
     if not rp.can_fetch(AGENT, url):
         raise PermissionError("ROBOTS_DISALLOWED")
+    if rp.crawl_delay(AGENT) or rp.request_rate(AGENT):
+        raise PermissionError("ROBOTS_PACING_REQUIRES_REVIEW")
 
 def get_html(url):
-    robots_check(url)       # Any inaccessible robots.txt fails closed.
+    robots_check(url)       # HTML requires an accessible, permitting robots policy.
     raw, ctype = _get_public(url, "text/html")
     if not ctype.lower().startswith("text/html"):
         raise ValueError("HTML_REQUIRED")
@@ -206,7 +223,7 @@ def detail_evidence(html, source_url, company, expected=None):
     out = [j for j in out if j.get("url") == source_url]
     if out:
         return out
-    if expected and approved_detail(company, source_url):
+    if expected and (approved_detail(company, source_url) or (company, source_url) == DIAGNOSTIC_ORIGIN[:2]):
         body = visible_text(html, source_url)
         if model_fields_grounded(expected["title"], expected["location"], source_url, source_url, body, []):
             return [{"url": source_url, "title": expected["title"], "location": expected["location"],
@@ -222,8 +239,9 @@ def select_probe_origin():
     for company, url, title, location in pending:
         if approved_detail(company, url):
             return company, url, {"title": title, "location": location}
-    company, url = PAGES[0]
-    return company, url, None
+    # Explicit manual diagnostics may use a separately reviewed public job.
+    # This role is excluded from outreach (no sponsorship), never a queue item.
+    return DIAGNOSTIC_ORIGIN
 
 
 def agent_reach_discovery():
@@ -237,13 +255,15 @@ def agent_reach_discovery():
         if not jobs:
             return {"status": "UNAVAILABLE", "checked_utc": checked, "items": 0, "code": "ORIGIN_EVIDENCE_MISSING"}
         job = jobs[0]
+        record_scrapling_proof(job)
         result = agent_read_verified(url, job["title"], timeout=12)
-        if result.get("status") == "OK":
+        if result.get("status") == "OK" and (company,url) != DIAGNOSTIC_ORIGIN[:2]:
             result["candidate"] = {k: job[k] for k in ("url", "company", "title", "location", "source_url")}
         result["checked_utc"] = timestamp()
+        result["diagnostic_only"] = (company,url) == DIAGNOSTIC_ORIGIN[:2]
         return result
-    except (PermissionError, HTTPError):
-        return {"status": "BLOCKED", "checked_utc": checked, "items": 0, "code": "ORIGIN_HTTP_OR_ROBOTS_BLOCKED"}
+    except (PermissionError, HTTPError) as exc:
+        return {"status": "BLOCKED", "checked_utc": checked, "items": 0, "code": public_failure(exc)}
     except Exception as exc:
         return {"status": "UNAVAILABLE", "checked_utc": checked, "items": 0, "code": type(exc).__name__}
 
@@ -274,11 +294,19 @@ def run_model_probe_background():
         if not jobs:
             raise ValueError("ORIGIN_EVIDENCE_MISSING")
         job = jobs[0]
+        record_scrapling_proof(job)
         body = visible_text(html, url)
         if not model_fields_grounded(job["title"], job["location"], url, url, body, []):
             raise ValueError("ORIGIN_VISIBLE_EVIDENCE_MISSING")
         # Pass only bounded origin text, not any credentials or external URL.
-        data = {"text": body[:3500], "expected_title": job["title"], "expected_location": job["location"]}
+        # Select short actual source excerpts, not inserted expected values.
+        # Keeps the 135M model within the free CPU/memory context budget.
+        snippets = []
+        for value in (job["title"],job["location"]):
+            pos = body.casefold().find(value.casefold())
+            if pos >= 0:
+                snippets.append(body[max(0,pos-24):pos+len(value)+48])
+        data = {"text": " ".join(snippets)[:700], "expected_title": job["title"], "expected_location": job["location"]}
         if not model_fields_grounded(job["title"], job["location"], url, url, data["text"], []):
             raise ValueError("BOUNDED_EVIDENCE_MISSING")
         env = {k: v for k, v in os.environ.items() if k in {"PATH","HOME","LANG","LC_ALL","OLLAMA_BASE_URL","OLLAMA_MODEL","OLLAMA_HOST","OLLAMA_CONTEXT_LENGTH"}}
@@ -290,15 +318,18 @@ def run_model_probe_background():
             info = {"status": "INVALID_RESULT"}
         if proc.returncode == 0 and info.get("status") == "PASSED" and info.get("verified_title") is True and info.get("verified_location") is True:
             status = {"status": "PASSED", "verified_title": True, "verified_location": True,
-                      "checked_utc": timestamp(), "candidate": {k: job[k] for k in ("url","company","title","location","source_url")}}
+                      "checked_utc": timestamp(), "diagnostic_only": (company,url) == DIAGNOSTIC_ORIGIN[:2]}
+            if not status["diagnostic_only"]:
+                status["candidate"] = {k: job[k] for k in ("url","company","title","location","source_url")}
         elif info.get("status") == "UNRELIABLE_OUTPUT":
             status["status"] = "UNRELIABLE_OUTPUT"
         else:
             status["error_type"] = str(info.get("error_type") or "PROBE_FAILED")[:90]
     except subprocess.TimeoutExpired:
         status["status"] = "TIMEOUT"
-    except (PermissionError, HTTPError):
+    except (PermissionError, HTTPError) as exc:
         status["status"] = "BLOCKED"
+        status["error_type"] = public_failure(exc)
     except Exception as exc:
         status["error_type"] = type(exc).__name__
     finally:
@@ -307,42 +338,61 @@ def run_model_probe_background():
                 conn.execute("INSERT INTO meta(key,value) VALUES('model_probe_result',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (json.dumps(status),))
                 if status.get("status") == "PASSED" and isinstance(status.get("candidate"), dict):
                     conn.execute("UPDATE detail_queue SET last_checked=NULL WHERE url=?", (status["candidate"]["url"],))
-        print(json.dumps({"event":"model_probe","status":status["status"],"checked_utc":status["checked_utc"]}), flush=True)
+        print(json.dumps({"event":"model_probe","status":status["status"],"code":status.get("error_type"),"verified_title":status.get("verified_title",False),"verified_location":status.get("verified_location",False),"checked_utc":status["checked_utc"]}), flush=True)
         with MODEL_PROBE_LOCK:
             MODEL_PROBE_ACTIVE = False
 
+def public_failure(exc):
+    if isinstance(exc, HTTPError):
+        return "ORIGIN_HTTP_" + str(exc.code)
+    code = str(exc)
+    return code if re.fullmatch(r"[A-Z0-9_]{1,60}",code) else type(exc).__name__
+
+
+def record_scrapling_proof(job):
+    proof = {"status":"PASSED","code":"ORIGIN_FIELDS_EXTRACTED","source_url":job["source_url"],
+             "title":job["title"],"location":job["location"],"checked_utc":timestamp(),"extraction":job["extraction"],
+             "diagnostic_only":(job["company"],job["source_url"]) == DIAGNOSTIC_ORIGIN[:2]}
+    with LOCK:
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.execute("INSERT INTO meta(key,value) VALUES('scrapling_result',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",(json.dumps(proof),))
+    print(json.dumps({"event":"scrapling_live","status":"PASSED","source":proof["source_url"],"extraction":proof["extraction"],"checked_utc":proof["checked_utc"],"diagnostic_only":proof["diagnostic_only"]}),flush=True)
+
+
 def get_adapter_status():
     with sqlite3.connect(DB_PATH) as conn:
-        row = conn.execute("SELECT value FROM meta WHERE key='agent_reach_result'").fetchone()
-        model = conn.execute("SELECT value FROM meta WHERE key='model_probe_result'").fetchone()
-    try:
-        agent = json.loads(row[0]) if row else None
-    except (ValueError, TypeError):
-        agent = None
-    try:
-        probe = json.loads(model[0]) if model else None
-    except (ValueError, TypeError):
-        probe = None
-    ready = ollama_ready()
-    return {"ok": True, "agent_reach": agent or {"status": "NOT_TESTED", "items": 0},
-            "scrapegraphai": probe if ready and probe else
-                {"status": "MODEL_READY_NOT_TESTED" if ready else "NO_LOCAL_MODEL"},
+        data = dict(conn.execute("SELECT key,value FROM meta WHERE key IN ('agent_reach_result','model_probe_result','scrapling_result')"))
+    def saved(key):
+        try: return json.loads(data[key])
+        except (KeyError,ValueError,TypeError): return None
+    runtime = ollama_status()
+    ready = runtime == "MODEL_READY"
+    return {"ok": True, "agent_reach": saved("agent_reach_result") or {"status": "NOT_TESTED", "items": 0},
+            "scrapling": saved("scrapling_result") or {"status":"NOT_TESTED"},
+            "scrapegraphai": (saved("model_probe_result") if ready else None) or
+                {"status": "MODEL_READY_NOT_TESTED" if ready else "NO_LOCAL_MODEL", "code":runtime},
             "checked_utc": timestamp()}
 
-def ollama_ready():
+
+def ollama_status():
     if os.getenv("ENABLE_LOCAL_SCRAPEGRAPHAI", "false").lower() != "true":
-        return False
+        return "LOCAL_MODEL_FLAG_OFF"
     base = os.getenv("OLLAMA_BASE_URL", "")
     model = os.getenv("OLLAMA_MODEL", "")
     if base not in ("http://127.0.0.1:11434", "http://localhost:11434") or not model:
-        return False
+        return "LOCAL_MODEL_CONFIG_INVALID"
     try:
-        with OPENER.open(Request(base + "/api/tags", headers={"Accept": "application/json"}), timeout=1.5) as response:
-            if response.status != 200: return False
+        with LOCAL_OPENER.open(Request(base + "/api/tags", headers={"Accept": "application/json"}), timeout=1.5) as response:
+            if response.status != 200: return "LOCAL_TAGS_HTTP_ERROR"
             payload = json.loads(response.read(65536))
-        return any(x.get("name") == model or x.get("model") == model for x in payload.get("models", []) if isinstance(x, dict))
-    except Exception:
-        return False
+        if not isinstance(payload,dict): return "LOCAL_TAGS_INVALID"
+        return "MODEL_READY" if any(x.get("name") == model or x.get("model") == model for x in payload.get("models", []) if isinstance(x, dict)) else "LOCAL_MODEL_NOT_LISTED"
+    except Exception as exc:
+        return "LOCAL_TAGS_UNAVAILABLE_" + type(exc).__name__.upper()
+
+
+def ollama_ready():
+    return ollama_status() == "MODEL_READY"
 
 def init_db():
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -378,7 +428,8 @@ def scan_source(source, expected=None):
 def safe_scan(source, expected=None):
     try:
         return "OK", scan_source(source, expected)
-    except (PermissionError, HTTPError):
+    except (PermissionError, HTTPError) as exc:
+        print(json.dumps({"event":"source_scan_blocked","source":source[3],"code":public_failure(exc)}),flush=True)
         return "BLOCKED", []
     except (TimeoutError, subprocess.TimeoutExpired):
         return "TIMEOUT", []
@@ -470,7 +521,7 @@ class Handler(BaseHTTPRequestHandler):
         if self.path != "/healthz":
             return self.json(404, {"ok": False})
         return self.json(200, {
-            "ok": True, "component": "careerops-research-bridge", "version": "1.1",
+            "ok": True, "component": "careerops-research-bridge", "version": "1.2",
             "scrapling_installed": installed("scrapling"),
             "scrapegraphai_installed": installed("scrapegraphai"),
             "agent_reach_installed": shutil.which("agent-reach") is not None,
