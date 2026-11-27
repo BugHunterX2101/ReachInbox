@@ -41,6 +41,12 @@ RUN mkdir -p /opt/ollama/models && \
 COPY bridge_adapters.py ./bridge_adapters.py
 COPY server.py ./server.py
 COPY model_probe.py ./model_probe.py
+COPY model_smoke.py ./model_smoke.py
+# Gate release on genuine CPU-local inference. No secrets or external API calls.
+RUN set -eu; ollama serve >/tmp/model-smoke-ollama.log 2>&1 & pid=$!; \
+    trap 'kill "$pid" 2>/dev/null || true' EXIT; \
+    for i in $(seq 1 30); do curl --noproxy '*' -fsS --max-time 1 http://127.0.0.1:11434/api/tags >/dev/null 2>&1 && break || sleep 1; done; \
+    python /app/model_smoke.py
 COPY test_bridge.py ./test_bridge.py
 RUN python -m py_compile server.py bridge_adapters.py model_probe.py && python -m unittest -v test_bridge
 COPY start.sh ./start.sh
