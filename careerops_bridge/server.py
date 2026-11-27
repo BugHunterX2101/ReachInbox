@@ -85,6 +85,8 @@ def _get_public(url, accept, maximum=LIMIT_BYTES):
         res = OPENER.open(Request(url, headers={"User-Agent": AGENT, "Accept": accept}), timeout=getattr(REQUEST_BUDGET,"timeout",PUBLIC_TIMEOUT))
     except TimeoutError:
         raise TimeoutError(phase+"_CONNECT_TIMEOUT") from None
+    except HTTPError:
+        raise
     except URLError as exc:
         if isinstance(exc.reason, TimeoutError):
             raise TimeoutError(phase+"_CONNECT_TIMEOUT") from None
@@ -452,7 +454,12 @@ def safe_scan(source, expected=None):
     try:
         return "OK", scan_source(source, expected)
     except (PermissionError, HTTPError) as exc:
-        print(json.dumps({"event":"source_scan_blocked","source":source[3],"code":public_failure(exc)}),flush=True)
+        reason=public_failure(exc)
+        print(json.dumps({"event":"source_scan_blocked","source":source[3],"code":reason}),flush=True)
+        if reason in ("ROBOTS_HTTP_429","ORIGIN_HTTP_429","ROBOTS_HTTP_403","ROBOTS_HTTP_401"):
+            # Respect host-wide throttling/robots access denial, not merely a board.
+            with sqlite3.connect(DB_PATH) as conn:
+                conn.execute("INSERT INTO source_cooldown(url,until_epoch,status) VALUES(?,?,?) ON CONFLICT(url) DO UPDATE SET until_epoch=excluded.until_epoch,status=excluded.status",("host:"+urlsplit(source[3]).hostname,time.time()+21600,"BLOCKED"))
         return "BLOCKED", []
     except (TimeoutError, subprocess.TimeoutExpired) as exc:
         print(json.dumps({"event":"source_scan_timeout","source":source[3],"code":public_failure(exc)}),flush=True)
@@ -468,7 +475,7 @@ def choose_work(inventory, cursor, detail, blocked, max_sources):
     def add(source, expected=None):
         url = source[3]
         host = urlsplit(url).hostname
-        if url in blocked or host in hosts or len(work)>=max_sources:
+        if url in blocked or "host:"+host in blocked or host in hosts or len(work)>=max_sources:
             return False
         work.append((source,expected)); hosts.add(host)
         return True
