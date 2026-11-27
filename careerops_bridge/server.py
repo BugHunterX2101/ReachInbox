@@ -23,18 +23,24 @@ from pathlib import Path
 from urllib.parse import urlsplit
 from urllib.request import Request, build_opener, HTTPRedirectHandler, ProxyHandler
 from urllib.robotparser import RobotFileParser
-from urllib.error import HTTPError
+from urllib.error import HTTPError, URLError
 from bridge_adapters import (APPROVED_FEEDS, agent_read_verified, clean, eligible_hint as candidate_eligible,
                              model_fields_grounded, norm, posting_url, reviewed_inventory, source_candidates)
 
 AGENT = "CareerOpsResearchBridge/1.0 (public jobs, read-only)"
 LIMIT_BYTES = 900_000
-PUBLIC_TIMEOUT = 2.5
+PUBLIC_TIMEOUT = 3.0
+PROBE_TIMEOUT = 10.0
+REQUEST_BUDGET = threading.local()
 PAGES = [
     ("Ubisar", "https://www.ubisar.com/vacancies/tech-intern"),
     ("Tecell", "https://careers.tecell.in/jobs/01a1ff0a-21e8-7e75-bb78-e17358385b66"),
 ]
-SOURCE_INVENTORY = reviewed_inventory(PAGES)
+# Start with distinct documented providers rather than two boards on the
+# same failing host. Retain all reviewed sources and the Europe/Canada priority.
+_base_inventory = reviewed_inventory(PAGES)
+_preferred = ("Quadrature Capital","Promise Robotics","Fellow Insights Inc.")
+SOURCE_INVENTORY = tuple(s for name in _preferred for s in _base_inventory if s[0]==name) + tuple(s for s in _base_inventory if s[0] not in _preferred and s[0]!="Ubisar")
 DB_PATH = Path(os.environ.get("CAREEROPS_DB", "/tmp/careerops.sqlite"))
 LOCK = threading.RLock()
 AGENT_PROBE_LOCK = threading.Lock()
@@ -49,7 +55,7 @@ class NoRedirect(HTTPRedirectHandler):
 OPENER = build_opener(NoRedirect())
 LOCAL_OPENER = build_opener(ProxyHandler({}), NoRedirect())
 # Diagnostic-only public employer posting; never enters discovery or outreach.
-DIAGNOSTIC_ORIGIN = ("Atlassian", "https://www.atlassian.com/company/careers/details/26070", {"title":"Software Engineer, 2027 Graduate Canada", "location":"Vancouver, British Columbia"})
+DIAGNOSTIC_ORIGIN = ("Ubisar", "https://www.ubisar.com/vacancies/tech-intern", {"title":"Tech Intern", "location":"India - Remote"})
 
 def timestamp():
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -74,11 +80,22 @@ def safe_text(value, limit):
 def _get_public(url, accept, maximum=LIMIT_BYTES):
     if not allowed_url(url):
         raise ValueError("PUBLIC_URL_INVALID")
-    res = OPENER.open(Request(url, headers={"User-Agent": AGENT, "Accept": accept}), timeout=PUBLIC_TIMEOUT)
+    phase = "ROBOTS" if urlsplit(url).path == "/robots.txt" else "ORIGIN"
+    try:
+        res = OPENER.open(Request(url, headers={"User-Agent": AGENT, "Accept": accept}), timeout=getattr(REQUEST_BUDGET,"timeout",PUBLIC_TIMEOUT))
+    except TimeoutError:
+        raise TimeoutError(phase+"_CONNECT_TIMEOUT") from None
+    except URLError as exc:
+        if isinstance(exc.reason, TimeoutError):
+            raise TimeoutError(phase+"_CONNECT_TIMEOUT") from None
+        raise ConnectionError(phase+"_NETWORK_ERROR") from None
     try:
         if res.status != 200 or res.geturl() != url:
             raise PermissionError("REDIRECT_OR_HTTP_NOT_ALLOWED")
-        raw = res.read(maximum + 1)
+        try:
+            raw = res.read(maximum + 1)
+        except TimeoutError:
+            raise TimeoutError(phase+'_READ_TIMEOUT') from None
         if len(raw) > maximum:
             raise ValueError("RESPONSE_LIMIT")
         return raw, res.headers.get("Content-Type", "")
@@ -250,6 +267,7 @@ def agent_reach_discovery():
         return {"status": "DISABLED", "checked_utc": checked, "items": 0, "code": "FLAG_OFF"}
     try:
         company, url, expected = select_probe_origin()
+        REQUEST_BUDGET.timeout = PROBE_TIMEOUT
         html = get_html(url)
         jobs = detail_evidence(html, url, company, expected)
         if not jobs:
@@ -264,8 +282,10 @@ def agent_reach_discovery():
         return result
     except (PermissionError, HTTPError) as exc:
         return {"status": "BLOCKED", "checked_utc": checked, "items": 0, "code": public_failure(exc)}
+    except TimeoutError as exc:
+        return {"status":"TIMEOUT","checked_utc":timestamp(),"items":0,"code":public_failure(exc)}
     except Exception as exc:
-        return {"status": "UNAVAILABLE", "checked_utc": checked, "items": 0, "code": type(exc).__name__}
+        return {"status":"UNAVAILABLE","checked_utc":timestamp(),"items":0,"code":public_failure(exc)}
 
 
 def run_agent_probe_background():
@@ -289,6 +309,7 @@ def run_model_probe_background():
     status = {"status": "FAILED", "verified_title": False, "checked_utc": timestamp()}
     try:
         company, url, expected = select_probe_origin()
+        REQUEST_BUDGET.timeout = PROBE_TIMEOUT
         html = get_html(url)
         jobs = detail_evidence(html, url, company, expected)
         if not jobs:
@@ -319,19 +340,21 @@ def run_model_probe_background():
         if proc.returncode == 0 and info.get("status") == "PASSED" and info.get("verified_title") is True and info.get("verified_location") is True:
             status = {"status": "PASSED", "verified_title": True, "verified_location": True,
                       "checked_utc": timestamp(), "diagnostic_only": (company,url) == DIAGNOSTIC_ORIGIN[:2]}
+            status["code"] = "ORIGIN_FIELDS_MATCHED"
             if not status["diagnostic_only"]:
                 status["candidate"] = {k: job[k] for k in ("url","company","title","location","source_url")}
         elif info.get("status") == "UNRELIABLE_OUTPUT":
             status["status"] = "UNRELIABLE_OUTPUT"
         else:
             status["error_type"] = str(info.get("error_type") or "PROBE_FAILED")[:90]
-    except subprocess.TimeoutExpired:
+    except (subprocess.TimeoutExpired, TimeoutError) as exc:
         status["status"] = "TIMEOUT"
+        status["error_type"] = public_failure(exc)
     except (PermissionError, HTTPError) as exc:
         status["status"] = "BLOCKED"
         status["error_type"] = public_failure(exc)
     except Exception as exc:
-        status["error_type"] = type(exc).__name__
+        status["error_type"] = public_failure(exc)
     finally:
         with LOCK:
             with sqlite3.connect(DB_PATH) as conn:
@@ -353,9 +376,8 @@ def record_scrapling_proof(job):
     proof = {"status":"PASSED","code":"ORIGIN_FIELDS_EXTRACTED","source_url":job["source_url"],
              "title":job["title"],"location":job["location"],"checked_utc":timestamp(),"extraction":job["extraction"],
              "diagnostic_only":(job["company"],job["source_url"]) == DIAGNOSTIC_ORIGIN[:2]}
-    with LOCK:
-        with sqlite3.connect(DB_PATH) as conn:
-            conn.execute("INSERT INTO meta(key,value) VALUES('scrapling_result',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",(json.dumps(proof),))
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute("INSERT INTO meta(key,value) VALUES('scrapling_result',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",(json.dumps(proof),))
     print(json.dumps({"event":"scrapling_live","status":"PASSED","source":proof["source_url"],"extraction":proof["extraction"],"checked_utc":proof["checked_utc"],"diagnostic_only":proof["diagnostic_only"]}),flush=True)
 
 
@@ -400,6 +422,7 @@ def init_db():
         conn.execute("CREATE TABLE IF NOT EXISTS jobs (url TEXT PRIMARY KEY, first_seen TEXT)")
         conn.execute("CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT)")
         conn.execute("CREATE TABLE IF NOT EXISTS detail_queue (url TEXT PRIMARY KEY, company TEXT NOT NULL, title TEXT NOT NULL, location TEXT NOT NULL, added_utc TEXT NOT NULL, last_checked TEXT)")
+        conn.execute("CREATE TABLE IF NOT EXISTS source_cooldown (url TEXT PRIMARY KEY, until_epoch REAL NOT NULL, status TEXT NOT NULL)")
 
 def scan_source(source, expected=None):
     company, kind, board, url = source
@@ -431,65 +454,83 @@ def safe_scan(source, expected=None):
     except (PermissionError, HTTPError) as exc:
         print(json.dumps({"event":"source_scan_blocked","source":source[3],"code":public_failure(exc)}),flush=True)
         return "BLOCKED", []
-    except (TimeoutError, subprocess.TimeoutExpired):
+    except (TimeoutError, subprocess.TimeoutExpired) as exc:
+        print(json.dumps({"event":"source_scan_timeout","source":source[3],"code":public_failure(exc)}),flush=True)
         return "TIMEOUT", []
     except Exception as exc:
         print(json.dumps({"event":"source_scan_error","source":source[3],"error_type":type(exc).__name__}), flush=True)
         return "ERROR", []
 
 
+def choose_work(inventory, cursor, detail, blocked, max_sources):
+    """Choose separate eligible hosts, never retry a blocked source in the same batch."""
+    work, hosts = [], set()
+    def add(source, expected=None):
+        url = source[3]
+        host = urlsplit(url).hostname
+        if url in blocked or host in hosts or len(work)>=max_sources:
+            return False
+        work.append((source,expected)); hosts.add(host)
+        return True
+    # Prefer an independently discovered original posting, then a different provider.
+    if max_sources==2:
+        for company,url,title,location in detail:
+            if approved_detail(company,url) and add((company,"HTML","",url),{"title":title,"location":location}):
+                break
+    n=len(inventory)
+    next_cursor=cursor
+    for offset in range(n):
+        i=(cursor+offset)%n
+        if add(inventory[i]):
+            next_cursor=(i+1)%n
+        if len(work)>=max_sources:
+            break
+    return work,next_cursor
+
+
 def collect(max_sources):
     if type(max_sources) is not int or not 1 <= max_sources <= 2:
         raise ValueError("INVALID_LIMIT")
     with LOCK:
-        # Read and release SQLite before network access; never share a connection
-        # across the two bounded source workers.
         with sqlite3.connect(DB_PATH) as conn:
             state = conn.execute("SELECT value FROM meta WHERE key='cursor'").fetchone()
             cursor = int(state[0]) % len(SOURCE_INVENTORY) if state else 0
             detail = conn.execute("SELECT company,url,title,location FROM detail_queue WHERE last_checked IS NULL ORDER BY added_utc,url LIMIT 10").fetchall()
-        work = [(SOURCE_INVENTORY[cursor], None)]
-        if max_sources == 2:
-            candidate = next((r for r in detail if approved_detail(r[0], r[1]) and r[1] != work[0][0][3]), None)
-            if candidate:
-                company, url, title, location = candidate
-                work.insert(0, ((company,"HTML","",url), {"title":title,"location":location}))
-            else:
-                work.append((SOURCE_INVENTORY[(cursor+1)%len(SOURCE_INVENTORY)], None))
-        advanced = sum(1 for _, expected in work if expected is None)
+            blocked = {r[0] for r in conn.execute("SELECT url FROM source_cooldown WHERE until_epoch>?",(time.time(),))}
+        work,cursor=choose_work(SOURCE_INVENTORY,cursor,detail,blocked,max_sources)
+        if not work:
+            return {"ok":True,"items":[],"scans":[],"state":{"sources":len(SOURCE_INVENTORY),"cursor":cursor}}
         with ThreadPoolExecutor(max_workers=len(work)) as pool:
-            results = list(pool.map(lambda x: safe_scan(*x), work))
-        items, scans, seen = [], [], set()
+            results=list(pool.map(lambda x:safe_scan(*x),work))
+        items,scans,seen=[],[],set()
         with sqlite3.connect(DB_PATH) as conn:
-            for (source, expected), (code, candidates) in zip(work, results):
-                company, kind, board, url = source
-                new = 0
-                if expected is not None:
-                    conn.execute("UPDATE detail_queue SET last_checked=? WHERE url=?", (timestamp(), url))
-                if code == "OK":
+            for (source,expected),(code,candidates) in zip(work,results):
+                company,kind,board,url=source
+                new=0
+                if code!="OK":
+                    # Defer actual access failures; no retry or alternate backend.
+                    cooldown=21600 if code=="BLOCKED" else 3600
+                    conn.execute("INSERT INTO source_cooldown(url,until_epoch,status) VALUES(?,?,?) ON CONFLICT(url) DO UPDATE SET until_epoch=excluded.until_epoch,status=excluded.status",(url,time.time()+cooldown,code))
+                if expected is not None and code=="OK":
+                    conn.execute("UPDATE detail_queue SET last_checked=? WHERE url=?",(timestamp(),url))
+                if code=="OK":
                     for job in candidates:
-                        if not eligible_hint(job) or job.get("source_url") != url or not allowed_url(job.get("url")):
+                        if not eligible_hint(job) or job.get("source_url")!=url or not allowed_url(job.get("url")):
                             continue
-                        if kind != "HTML" and approved_detail(company, job["url"]):
-                            conn.execute("INSERT OR IGNORE INTO detail_queue(url,company,title,location,added_utc) VALUES(?,?,?,?,?)",
-                                         (job["url"], company, clean(job["title"],220), clean(job["location"],200), timestamp()))
-                    # Prefer unseen jobs, but allow bounded replay of older records
-                    # so a failed HTTP delivery cannot permanently hide a discovery.
-                    ordered = sorted(candidates, key=lambda j: conn.execute("SELECT 1 FROM jobs WHERE url=?", (j["url"],)).fetchone() is not None)
+                        if kind!="HTML" and approved_detail(company,job["url"]):
+                            conn.execute("INSERT OR IGNORE INTO detail_queue(url,company,title,location,added_utc) VALUES(?,?,?,?,?)",(job["url"],company,clean(job["title"],220),clean(job["location"],200),timestamp()))
+                    ordered=sorted(candidates,key=lambda j:conn.execute("SELECT 1 FROM jobs WHERE url=?",(j["url"],)).fetchone() is not None)
                     for job in ordered:
-                        if len(items) >= 3 or job["url"] in seen or job.get("source_url") != url or not allowed_url(job["url"]) or not eligible_hint(job):
+                        if len(items)>=3 or job["url"] in seen or job.get("source_url")!=url or not allowed_url(job["url"]) or not eligible_hint(job):
                             continue
                         seen.add(job["url"])
-                        inserted = conn.execute("INSERT OR IGNORE INTO jobs(url,first_seen) VALUES(?,?)", (job["url"],timestamp())).rowcount
-                        new += int(inserted == 1)
-                        item = {key: job[key] for key in ("url","company","title","location","source_url","extraction")}
-                        item.update({"checked_utc":timestamp(),"status":"HOLD",
-                                     "blocker":"Independent current role, 2027 timing, history, contact, resume and projects still required."})
+                        inserted=conn.execute("INSERT OR IGNORE INTO jobs(url,first_seen) VALUES(?,?)",(job["url"],timestamp())).rowcount
+                        new+=int(inserted==1)
+                        item={key:job[key] for key in ("url","company","title","location","source_url","extraction")}
+                        item.update({"checked_utc":timestamp(),"status":"HOLD","blocker":"Independent current role, 2027 timing, history, contact, resume and projects still required."})
                         items.append(item)
                 scans.append({"source":url,"status":code,"new":new})
-            cursor = (cursor + advanced) % len(SOURCE_INVENTORY)
-            conn.execute("INSERT INTO meta(key,value) VALUES('cursor',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (str(cursor),))
-            # Keep local discovery cache bounded. Downstream dedup is authoritative.
+            conn.execute("INSERT INTO meta(key,value) VALUES('cursor',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",(str(cursor),))
             conn.execute("DELETE FROM detail_queue WHERE url NOT IN (SELECT url FROM detail_queue ORDER BY added_utc DESC,url LIMIT 250)")
         print(json.dumps({"event":"collect","checked_utc":timestamp(),"scans":scans,"items":len(items)}),flush=True)
         return {"ok":True,"items":items,"scans":scans,"state":{"sources":len(SOURCE_INVENTORY),"cursor":cursor}}
@@ -521,7 +562,7 @@ class Handler(BaseHTTPRequestHandler):
         if self.path != "/healthz":
             return self.json(404, {"ok": False})
         return self.json(200, {
-            "ok": True, "component": "careerops-research-bridge", "version": "1.2",
+            "ok": True, "component": "careerops-research-bridge", "version": "1.3",
             "scrapling_installed": installed("scrapling"),
             "scrapegraphai_installed": installed("scrapegraphai"),
             "agent_reach_installed": shutil.which("agent-reach") is not None,
