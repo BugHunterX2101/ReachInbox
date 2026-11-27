@@ -10,6 +10,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     CAREEROPS_DB=/tmp/careerops.sqlite \
     PORT=8000 \
     OLLAMA_HOST=127.0.0.1:11434 \
+    OLLAMA_BASE_URL=http://127.0.0.1:11434 \
     OLLAMA_MODELS=/opt/ollama/models \
     OLLAMA_MODEL=smollm2:135m-instruct-q4_0 \
     OLLAMA_NUM_PARALLEL=1 \
