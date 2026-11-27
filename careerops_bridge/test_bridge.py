@@ -72,8 +72,11 @@ class CollectorTests(unittest.TestCase):
         self.temp=tempfile.TemporaryDirectory()
         self.db=patch.object(server,"DB_PATH",Path(self.temp.name)/"test.sqlite")
         self.db.start()
+        self.review_holds=patch.object(server,"REVIEW_REQUIRED_HOSTS",frozenset())
+        self.review_holds.start()
         server.init_db()
     def tearDown(self):
+        self.review_holds.stop()
         self.db.stop()
         self.temp.cleanup()
     def test_feed_to_detail_hold_only(self):
@@ -259,6 +262,33 @@ class LocalModelContractTests(unittest.TestCase):
         from model_probe import local_extract
         with self.assertRaisesRegex(ValueError,"LOCAL_OLLAMA_ONLY"):
             local_extract("test","https://example.com","model")
+
+class RestartSafeSourceTests(unittest.TestCase):
+    def test_review_holds_and_durable_skips_survive_empty_database(self):
+        with tempfile.TemporaryDirectory() as d,patch.object(server,"DB_PATH",Path(d)/"fresh.sqlite"):
+            server.init_db()
+            skip=server.SOURCE_INVENTORY[0][3]
+            with patch.object(server,"safe_scan",return_value=("OK",[])):
+                result=server.collect(2,[skip])
+            self.assertNotIn(skip,[s["source"] for s in result["scans"]])
+            from urllib.parse import urlsplit
+            self.assertTrue(all(urlsplit(s["source"]).hostname not in server.REVIEW_REQUIRED_HOSTS for s in result["scans"]))
+            self.assertTrue(result["scans"])
+
+    def test_skips_never_create_network_target(self):
+        self.assertEqual(server.validated_source_skips(["https://not-reviewed.example/"]),set())
+        with self.assertRaises(ValueError): server.validated_source_skips(["x"]*33)
+        with self.assertRaises(ValueError): server.validated_source_skips([{"url":"https://example.org"}])
+
+    def test_exact_public_html_role_is_extracted_without_inventing_fields(self):
+        url="https://www.atoconn.com/vacancies/intern-software-developer/"
+        html="<html><body><h1>Intern Software Developer</h1><p>Role: Intern Software Developer</p><p>Location: Kalyan, Maharashtra</p><p>Experience: Final-year students</p></body></html>"
+        result=server.detail_evidence(html,url,"ATOCONN")
+        self.assertEqual(len(result),1)
+        self.assertEqual(result[0]["title"],"Intern Software Developer")
+        self.assertEqual(result[0]["location"],"Kalyan, Maharashtra")
+        self.assertTrue(server.eligible_hint(result[0]))
+        self.assertFalse(server.detail_evidence("<html><body>No vacancy</body></html>",url,"ATOCONN"))
 
 if __name__ == "__main__":
     unittest.main()
