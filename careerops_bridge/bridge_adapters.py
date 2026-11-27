@@ -74,7 +74,7 @@ def eligible_hint(title, location, description=""):
         return False
     if re.search(r"\b(senior|staff|principal|lead|director|manager)\b", t):
         return False
-    india = bool(re.search(r"\b(india|bengaluru|bangalore|hyderabad|pune|mumbai|delhi|gurugram|gurgaon|chennai|noida)\b", loc))
+    india = bool(re.search(r"\b(india|bengaluru|bangalore|hyderabad|pune|mumbai|delhi|gurugram|gurgaon|chennai|noida|maharashtra|karnataka|telangana|gujarat|kerala|tamil nadu)\b", loc))
     overseas = bool(re.search(r"\b(united kingdom|uk|london|cambridge|edinburgh|manchester|canada|toronto|ottawa|waterloo|vancouver|montreal|montréal|calgary|england|scotland|wales|germany|berlin|munich|france|paris|netherlands|amsterdam|switzerland|zurich|zürich|geneva|lausanne|ireland|dublin|sweden|stockholm|norway|oslo|denmark|copenhagen|poland|warsaw|austria|vienna|belgium|brussels|finland|helsinki|czechia|prague|spain|madrid|portugal|lisbon|italy|milan|luxembourg)\b", loc))
     if overseas:
         # A location containing both India and overseas is ambiguous, not verified.
