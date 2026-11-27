@@ -133,15 +133,19 @@ def agent_read_verified(url, expected_title, timeout=12, runner=subprocess.run):
     # Do not inherit provider keys, auth tokens, proxy settings or login/session secrets.
     env = {k: v for k, v in os.environ.items() if k in {"PATH", "HOME", "LANG", "LC_ALL", "SSL_CERT_FILE", "SSL_CERT_DIR", "REQUESTS_CA_BUNDLE", "XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_CACHE_HOME"}}
     kwargs = dict(capture_output=True, text=True, check=False, env=env)
+    phase = "CHANNELS"
     try:
-        channels = runner(["agent-reach", "channels"], timeout=3, **kwargs)
+        # Cold CLI import on the free CPU instance can exceed three seconds.
+        # This is one bounded manual probe, not a retry loop.
+        channels = runner(["agent-reach", "channels"], timeout=15, **kwargs)
         if channels.returncode or len(channels.stdout) > 262144:
             raise ValueError("CHANNEL_CONTRACT_UNAVAILABLE")
         declared = json.loads(channels.stdout)
         supported = any(c.get("name") == "web" and any(a.get("name") == "read" and "jina" in a.get("backends", []) for a in c.get("actions", []) if isinstance(a, dict)) for c in declared.get("channels", []) if isinstance(c, dict)) if isinstance(declared, dict) else False
         if not supported:
             return {"status": "UNAVAILABLE", "items": 0, "code": "ANONYMOUS_BACKEND_NOT_DECLARED"}
-        proc = runner(["agent-reach", "web", "read", url, "--backend", "jina", "--timeout", str(timeout)], timeout=timeout + 2, **kwargs)
+        phase = "READ"
+        proc = runner(["agent-reach", "web", "read", url, "--backend", "jina", "--timeout", str(timeout)], timeout=timeout + 5, **kwargs)
         if len(proc.stdout) > 262144:
             return {"status": "UNAVAILABLE", "items": 0, "code": "CLI_RESPONSE_LIMIT"}
         data = json.loads(proc.stdout)
@@ -167,7 +171,7 @@ def agent_read_verified(url, expected_title, timeout=12, runner=subprocess.run):
                 return {"status": "OK", "items": 1, "code": "ORIGIN_TITLE_CORROBORATED", "source_url": url, "title": title}
         return {"status": "UNAVAILABLE", "items": 0, "code": "NO_CORROBORATED_PUBLIC_CONTENT"}
     except subprocess.TimeoutExpired:
-        return {"status": "TIMEOUT", "items": 0, "code": "CLI_TIMEOUT"}
+        return {"status": "TIMEOUT", "items": 0, "code": "CLI_" + phase + "_TIMEOUT"}
     except FileNotFoundError:
         return {"status": "UNAVAILABLE", "items": 0, "code": "CLI_NOT_INSTALLED"}
     except (ValueError, TypeError, AttributeError):
