@@ -113,5 +113,47 @@ class CollectorTests(unittest.TestCase):
         self.assertTrue(all(i["status"]=="HOLD" for i in result["items"]))
         self.assertEqual(result["state"]["sources"],len(adapters.APPROVED_FEEDS)+len(server.PAGES))
 
+
+class AccessPolicyTests(unittest.TestCase):
+    def test_missing_robots_only_for_documented_api(self):
+        from urllib.error import HTTPError
+        with patch.object(server,"_get_public",side_effect=HTTPError("https://example.com/robots.txt",404,"not found",None,None)):
+            server.robots_check(FEED[3])
+            with self.assertRaisesRegex(PermissionError,"ROBOTS_HTTP_404"):
+                server.robots_check(server.DIAGNOSTIC_ORIGIN[1])
+
+    def test_access_denial_rate_limit_and_server_error_fail_closed(self):
+        from urllib.error import HTTPError
+        for code in (401,403,429,500,503):
+            with patch.object(server,"_get_public",side_effect=HTTPError("https://example.com/robots.txt",code,"error",None,None)):
+                with self.assertRaisesRegex(PermissionError,"ROBOTS_HTTP_"+str(code)):
+                    server.robots_check(FEED[3])
+
+    def test_explicit_robots_disallow_preserved(self):
+        with patch.object(server,"_get_public",return_value=(b"User-agent: *\nDisallow: /posting-api/\n","text/plain")):
+            with self.assertRaisesRegex(PermissionError,"ROBOTS_DISALLOWED"):
+                server.robots_check(FEED[3])
+
+    def test_robot_challenge_not_permission(self):
+        with patch.object(server,"_get_public",return_value=(b"<html>Access denied</html>","text/html")):
+            with self.assertRaisesRegex(PermissionError,"ROBOTS_CONTENT_TYPE"):
+                server.robots_check(FEED[3])
+
+    def test_probe_target_is_diagnostic_only_and_origin_grounded(self):
+        company,url,expected=server.DIAGNOSTIC_ORIGIN
+        self.assertNotIn(url,[s[3] for s in server.SOURCE_INVENTORY])
+        html="<html><body><h1>"+expected["title"]+"</h1><p>"+expected["location"]+"</p></body></html>"
+        jobs=server.detail_evidence(html,url,company,expected)
+        self.assertEqual(len(jobs),1)
+        self.assertEqual(jobs[0]["extraction"],"scrapling:origin_visible_text")
+        self.assertFalse(server.detail_evidence("<html><body>No vacancy</body></html>",url,company,expected))
+
+    def test_local_model_configuration_fails_closed(self):
+        with patch.dict(os.environ,{"ENABLE_LOCAL_SCRAPEGRAPHAI":"false"}):
+            self.assertEqual(server.ollama_status(),"LOCAL_MODEL_FLAG_OFF")
+        with patch.dict(os.environ,{"ENABLE_LOCAL_SCRAPEGRAPHAI":"true","OLLAMA_BASE_URL":"https://external.example","OLLAMA_MODEL":"model"}):
+            self.assertEqual(server.ollama_status(),"LOCAL_MODEL_CONFIG_INVALID")
+
+
 if __name__ == "__main__":
     unittest.main()
