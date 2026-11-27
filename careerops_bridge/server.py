@@ -5,7 +5,7 @@ No Gmail/Sheets credentials, scheduler, contact harvesting or READY promotion.
 """
 from __future__ import annotations
 
-import csv
+from concurrent.futures import ThreadPoolExecutor
 import hmac
 import importlib.util
 import json
@@ -23,13 +23,18 @@ from pathlib import Path
 from urllib.parse import urlsplit
 from urllib.request import Request, build_opener, HTTPRedirectHandler
 from urllib.robotparser import RobotFileParser
+from urllib.error import HTTPError
+from bridge_adapters import (APPROVED_FEEDS, agent_read_verified, clean, eligible_hint as candidate_eligible,
+                             model_fields_grounded, norm, posting_url, reviewed_inventory, source_candidates)
 
 AGENT = "CareerOpsResearchBridge/1.0 (public jobs, read-only)"
 LIMIT_BYTES = 900_000
+PUBLIC_TIMEOUT = 2.5
 PAGES = [
     ("Ubisar", "https://www.ubisar.com/vacancies/tech-intern"),
     ("Tecell", "https://careers.tecell.in/jobs/01a1ff0a-21e8-7e75-bb78-e17358385b66"),
 ]
+SOURCE_INVENTORY = reviewed_inventory(PAGES)
 DB_PATH = Path(os.environ.get("CAREEROPS_DB", "/tmp/careerops.sqlite"))
 LOCK = threading.RLock()
 AGENT_PROBE_LOCK = threading.Lock()
@@ -61,16 +66,12 @@ def allowed_url(s):
         return False
 
 def safe_text(value, limit):
-    text = re.sub(r"<[^>]*>", " ", str(value or ""))
-    text = unescape(text)
-    # No private contact data is collected or returned.
-    text = re.sub(r"[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}", "[redacted]", text)
-    return re.sub(r"\s+", " ", text).strip()[:limit]
+    return clean(value, limit)
 
 def _get_public(url, accept, maximum=LIMIT_BYTES):
     if not allowed_url(url):
         raise ValueError("PUBLIC_URL_INVALID")
-    res = OPENER.open(Request(url, headers={"User-Agent": AGENT, "Accept": accept}), timeout=7)
+    res = OPENER.open(Request(url, headers={"User-Agent": AGENT, "Accept": accept}), timeout=PUBLIC_TIMEOUT)
     try:
         if res.status != 200 or res.geturl() != url:
             raise PermissionError("REDIRECT_OR_HTTP_NOT_ALLOWED")
@@ -95,7 +96,26 @@ def get_html(url):
     raw, ctype = _get_public(url, "text/html")
     if not ctype.lower().startswith("text/html"):
         raise ValueError("HTML_REQUIRED")
-    return raw.decode("utf-8", "replace")
+    html = raw.decode("utf-8", "replace")
+    if re.search(r"<title[^>]*>\s*(just a moment|access denied|security verification|sign in|log in)", html[:16000], re.I):
+        raise PermissionError("ACCESS_CHALLENGE")
+    return html
+
+
+def get_json(url):
+    if url not in {source[3] for source in APPROVED_FEEDS}:
+        raise ValueError("UNREVIEWED_FEED")
+    robots_check(url)
+    raw, ctype = _get_public(url, "application/json")
+    if not ctype.lower().startswith("application/json"):
+        raise ValueError("JSON_REQUIRED")
+    return json.loads(raw)
+
+
+def visible_text(html, source_url):
+    from scrapling import Selector
+    return clean(Selector(html, url=source_url).get_all_text(separator=" ", strip=True,
+                 ignore_tags=("script", "style", "noscript", "head")), LIMIT_BYTES)
 
 def parse_jobposting(html, source_url, company):
     from scrapling import Selector
@@ -140,70 +160,93 @@ def parse_jobposting(html, source_url, company):
     return out
 
 def scrapegraph_fallback(html, source_url, company):
-    # Never make public collection wait on unverified local inference.
-    if os.getenv("ENABLE_SCRAPEGRAPH_AUTO", "false").lower() != "true":
+    """Local model output may corroborate origin text, never invent a job URL."""
+    if os.getenv("ENABLE_SCRAPEGRAPH_AUTO", "false").lower() != "true" or not ollama_ready():
         return []
-    if os.getenv("ENABLE_LOCAL_SCRAPEGRAPHAI", "false").lower() != "true":
+    # The authenticated manual model probe is a prerequisite to production inference.
+    with sqlite3.connect(DB_PATH) as conn:
+        row = conn.execute("SELECT value FROM meta WHERE key='model_probe_result'").fetchone()
+    probe = json.loads(row[0]) if row else {}
+    if probe.get("status") != "PASSED" or not fresh(probe.get("checked_utc")):
         return []
-    base, model = os.getenv("OLLAMA_BASE_URL", ""), os.getenv("OLLAMA_MODEL", "")
-    if base not in ("http://127.0.0.1:11434", "http://localhost:11434") or not model:
-        raise RuntimeError("LOCAL_OLLAMA_REQUIRED")
-    from scrapegraphai.graphs import SmartScraperGraph
-    graph = SmartScraperGraph(
-        prompt='Return JSON {"jobs":[{"title":"", "location":"", "url":""}]} only for actual currently advertised jobs. Do not invent fields or collect emails.',
-        source=html,
-        config={"llm": {"model": "ollama/" + model, "base_url": base, "temperature": 0, "format": "json"},
-                "verbose": False})
-    response = graph.run()
-    out = []
-    for item in response.get("jobs", [])[:6] if isinstance(response, dict) else []:
-        if not isinstance(item, dict):
-            continue
-        url = item.get("url", "")
-        if allowed_url(url) and urlsplit(url).hostname == urlsplit(source_url).hostname:
-            out.append({"url": url, "title": safe_text(item.get("title"), 220),
-                        "company": company, "location": safe_text(item.get("location"), 200),
-                        "source_url": source_url, "extraction": "scrapegraphai:unverified_hint"})
-    return out
+    # Model calls are isolated and time-limited; do not make repeated provider attempts.
+    # The existing synchronous collection has an 8-second client deadline; slow
+    # inference is therefore consumed from a completed, manually requested probe.
+    job = probe.get("candidate")
+    if not isinstance(job, dict) or job.get("source_url") != source_url:
+        return []
+    if not model_fields_grounded(job.get("title"), job.get("location"), job.get("url"),
+                                 source_url, visible_text(html, source_url), []):
+        return []
+    return [{"url": source_url, "title": clean(job["title"], 220),
+             "location": clean(job["location"], 200), "company": company,
+             "source_url": source_url, "extraction": "scrapegraphai:grounded_local_probe",
+             "description": visible_text(html, source_url)[:16000]}]
+
+
+def fresh(stamp, seconds=86400):
+    try:
+        age = (datetime.now(timezone.utc) - datetime.fromisoformat(stamp.replace("Z", "+00:00"))).total_seconds()
+        return 0 <= age <= seconds
+    except (AttributeError, TypeError, ValueError):
+        return False
+
 
 def eligible_hint(job):
-    title, location = job["title"].lower(), job["location"].lower()
-    if not re.search(r"software|engineer|backend|developer|ai |machine learning|full.stack|data|devops", title):
-        return False
-    if re.search(r"\bsenior\b|\bstaff\b|\bprincipal\b|\blead\b", title):
-        return False
-    india = bool(re.search(r"india|bengaluru|bangalore|remote india", location))
-    international = bool(re.search(r"united kingdom|uk|london|canada|toronto|ottawa|england|germany|france|netherlands|switzerland|ireland|sweden|norway|denmark|poland", location))
-    if international:
-        return bool(re.search(r"\b2027\b", title) and re.search(r"grad|graduate|new grad|campus", title) and not re.search(r"intern|placement|co.op", title))
-    return india
+    return candidate_eligible(job.get("title", ""), job.get("location", ""), job.get("description", ""))
+
+
+def approved_detail(company, url):
+    return any(company == c and posting_url(url, ats, board) == url for c, ats, board, _ in APPROVED_FEEDS)
+
+
+def detail_evidence(html, source_url, company, expected=None):
+    """Actual Scrapling extraction, including a deterministic ATS-to-page corroboration."""
+    out = parse_jobposting(html, source_url, company)
+    out = [j for j in out if j.get("url") == source_url]
+    if out:
+        return out
+    if expected and approved_detail(company, source_url):
+        body = visible_text(html, source_url)
+        if model_fields_grounded(expected["title"], expected["location"], source_url, source_url, body, []):
+            return [{"url": source_url, "title": expected["title"], "location": expected["location"],
+                     "company": company, "source_url": source_url,
+                     "extraction": "scrapling:origin_visible_text", "description": body[:16000]}]
+    return []
+
+
+def select_probe_origin():
+    """Select an actual previously discovered, approved public job; static seeds only as fallback."""
+    with sqlite3.connect(DB_PATH) as conn:
+        pending = conn.execute("SELECT company,url,title,location FROM detail_queue ORDER BY added_utc DESC,url LIMIT 10").fetchall()
+    for company, url, title, location in pending:
+        if approved_detail(company, url):
+            return company, url, {"title": title, "location": location}
+    company, url = PAGES[0]
+    return company, url, None
+
 
 def agent_reach_discovery():
-    """One explicit, read-only public-web probe. Never asks for logins or uses account sessions."""
     checked = timestamp()
     if os.getenv("ENABLE_AGENT_REACH_PUBLIC", "false").lower() != "true":
         return {"status": "DISABLED", "checked_utc": checked, "items": 0, "code": "FLAG_OFF"}
-    # A public GitHub README is a stable verification target; not contact harvesting.
-    cmd = ["agent-reach", "web", "read", "https://www.ubisar.com/vacancies/tech-intern", "--timeout", "18"]
     try:
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=25, check=False)
-    except subprocess.TimeoutExpired:
-        return {"status": "TIMEOUT", "checked_utc": checked, "items": 0, "code": "CLI_TIMEOUT"}
-    except FileNotFoundError:
-        return {"status": "UNAVAILABLE", "checked_utc": checked, "items": 0, "code": "CLI_NOT_INSTALLED"}
-    try:
-        data = json.loads(proc.stdout[:65_536])
-    except (ValueError, TypeError):
-        return {"status": "UNAVAILABLE", "checked_utc": checked, "items": 0, "code": "INVALID_CLI_JSON"}
-    error = data.get("error") if isinstance(data, dict) else None
-    code = str(error.get("code", ""))[:55] if isinstance(error, dict) else "CLI_EXIT_" + str(proc.returncode)
-    hits = data.get("items") if isinstance(data, dict) else None
-    count = len(hits) if isinstance(hits, list) else 0
-    if proc.returncode == 0 and data.get("ok") is True and count > 0:
-        return {"status": "OK", "checked_utc": checked, "items": count, "code": "PUBLIC_READ_VERIFIED"}
-    if code in {"RATE_LIMITED", "PLATFORM_BLOCKED", "NEED_LOGIN", "BUSY"}:
-        return {"status": "BLOCKED", "checked_utc": checked, "items": 0, "code": code}
-    return {"status": "UNAVAILABLE", "checked_utc": checked, "items": 0, "code": code or "NO_PUBLIC_ITEMS"}
+        company, url, expected = select_probe_origin()
+        html = get_html(url)
+        jobs = detail_evidence(html, url, company, expected)
+        if not jobs:
+            return {"status": "UNAVAILABLE", "checked_utc": checked, "items": 0, "code": "ORIGIN_EVIDENCE_MISSING"}
+        job = jobs[0]
+        result = agent_read_verified(url, job["title"], timeout=12)
+        if result.get("status") == "OK":
+            result["candidate"] = {k: job[k] for k in ("url", "company", "title", "location", "source_url")}
+        result["checked_utc"] = timestamp()
+        return result
+    except (PermissionError, HTTPError):
+        return {"status": "BLOCKED", "checked_utc": checked, "items": 0, "code": "ORIGIN_HTTP_OR_ROBOTS_BLOCKED"}
+    except Exception as exc:
+        return {"status": "UNAVAILABLE", "checked_utc": checked, "items": 0, "code": type(exc).__name__}
+
 
 def run_agent_probe_background():
     """Only an authenticated request starts this; never a scheduler."""
@@ -213,40 +256,54 @@ def run_agent_probe_background():
         with LOCK:
             with sqlite3.connect(DB_PATH) as conn:
                 conn.execute("INSERT INTO meta(key,value) VALUES('agent_reach_result',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (json.dumps(result),))
+        print(json.dumps({"event":"agent_probe","status":result.get("status"),"code":result.get("code"),"checked_utc":result.get("checked_utc")}),flush=True)
     finally:
         with AGENT_PROBE_LOCK:
             AGENT_PROBE_ACTIVE = False
 
 def run_model_probe_background():
-    """One manual bounded test of the real SmartScraperGraph class and local Ollama."""
+    """A bounded genuine-source local-model probe, triggered only by authorized request."""
     global MODEL_PROBE_ACTIVE
     status = {"status": "FAILED", "verified_title": False, "checked_utc": timestamp()}
     try:
-        proc = subprocess.run(
-            ["python", "/app/model_probe.py"], capture_output=True, text=True,
-            timeout=110, check=False,
-        )
+        company, url, expected = select_probe_origin()
+        html = get_html(url)
+        jobs = detail_evidence(html, url, company, expected)
+        if not jobs:
+            raise ValueError("ORIGIN_EVIDENCE_MISSING")
+        job = jobs[0]
+        body = visible_text(html, url)
+        if not model_fields_grounded(job["title"], job["location"], url, url, body, []):
+            raise ValueError("ORIGIN_VISIBLE_EVIDENCE_MISSING")
+        # Pass only bounded origin text, not any credentials or external URL.
+        data = {"text": body[:3500], "expected_title": job["title"], "expected_location": job["location"]}
+        if not model_fields_grounded(job["title"], job["location"], url, url, data["text"], []):
+            raise ValueError("BOUNDED_EVIDENCE_MISSING")
+        env = {k: v for k, v in os.environ.items() if k in {"PATH","HOME","LANG","LC_ALL","OLLAMA_BASE_URL","OLLAMA_MODEL","OLLAMA_HOST","OLLAMA_CONTEXT_LENGTH"}}
+        proc = subprocess.run(["python", "/app/model_probe.py"], input=json.dumps(data),
+                              capture_output=True, text=True, timeout=110, check=False, env=env)
         try:
-            info = json.loads(proc.stdout[-1600:])
-        except (ValueError, TypeError):
+            info = json.loads(proc.stdout.strip().splitlines()[-1])
+        except (IndexError, ValueError, TypeError):
             info = {"status": "INVALID_RESULT"}
-        if proc.returncode == 0 and info.get("status") == "PASSED" and info.get("verified_title") is True:
-            status["status"] = "PASSED"
-            status["verified_title"] = True
+        if proc.returncode == 0 and info.get("status") == "PASSED" and info.get("verified_title") is True and info.get("verified_location") is True:
+            status = {"status": "PASSED", "verified_title": True, "verified_location": True,
+                      "checked_utc": timestamp(), "candidate": {k: job[k] for k in ("url","company","title","location","source_url")}}
         elif info.get("status") == "UNRELIABLE_OUTPUT":
             status["status"] = "UNRELIABLE_OUTPUT"
         else:
-            status["status"] = "FAILED"
             status["error_type"] = str(info.get("error_type") or "PROBE_FAILED")[:90]
     except subprocess.TimeoutExpired:
         status["status"] = "TIMEOUT"
+    except (PermissionError, HTTPError):
+        status["status"] = "BLOCKED"
     except Exception as exc:
-        status["status"] = "FAILED"
         status["error_type"] = type(exc).__name__
     finally:
         with LOCK:
             with sqlite3.connect(DB_PATH) as conn:
                 conn.execute("INSERT INTO meta(key,value) VALUES('model_probe_result',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (json.dumps(status),))
+        print(json.dumps({"event":"model_probe","status":status["status"],"checked_utc":status["checked_utc"]}), flush=True)
         with MODEL_PROBE_LOCK:
             MODEL_PROBE_ACTIVE = False
 
@@ -288,42 +345,99 @@ def init_db():
     with sqlite3.connect(DB_PATH) as conn:
         conn.execute("CREATE TABLE IF NOT EXISTS jobs (url TEXT PRIMARY KEY, first_seen TEXT)")
         conn.execute("CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT)")
+        conn.execute("CREATE TABLE IF NOT EXISTS detail_queue (url TEXT PRIMARY KEY, company TEXT NOT NULL, title TEXT NOT NULL, location TEXT NOT NULL, added_utc TEXT NOT NULL, last_checked TEXT)")
+
+def scan_source(source, expected=None):
+    company, kind, board, url = source
+    if kind == "HTML":
+        if (company, url) not in PAGES and not approved_detail(company, url):
+            raise ValueError("UNREVIEWED_ORIGIN")
+        html = get_html(url)
+        jobs = detail_evidence(html, url, company, expected)
+        # A completed model extraction may provide independent grounded evidence
+        # even where deterministic extraction exists. No inference in this request.
+        model_jobs = scrapegraph_fallback(html, url, company)
+        if model_jobs:
+            jobs = model_jobs
+        with sqlite3.connect(DB_PATH) as conn:
+            row = conn.execute("SELECT value FROM meta WHERE key='agent_reach_result'").fetchone()
+        agent = json.loads(row[0]) if row else {}
+        proof = agent.get("candidate")
+        if os.getenv("ENABLE_AGENT_REACH_PUBLIC", "false").lower() == "true" and agent.get("status") == "OK" and fresh(agent.get("checked_utc")) and isinstance(proof, dict):
+            for job in jobs:
+                if all(job.get(k) == proof.get(k) for k in ("url","company","title","location","source_url")):
+                    job["extraction"] = "agent_reach:origin_corroborated"
+        return [j for j in jobs if eligible_hint(j)]
+    return source_candidates(source, get_json, get_html, parse_jobposting, scrapegraph_fallback)
+
+
+def safe_scan(source, expected=None):
+    try:
+        return "OK", scan_source(source, expected)
+    except (PermissionError, HTTPError):
+        return "BLOCKED", []
+    except (TimeoutError, subprocess.TimeoutExpired):
+        return "TIMEOUT", []
+    except Exception as exc:
+        print(json.dumps({"event":"source_scan_error","source":source[3],"error_type":type(exc).__name__}), flush=True)
+        return "ERROR", []
+
 
 def collect(max_sources):
+    if type(max_sources) is not int or not 1 <= max_sources <= 2:
+        raise ValueError("INVALID_LIMIT")
     with LOCK:
+        # Read and release SQLite before network access; never share a connection
+        # across the two bounded source workers.
         with sqlite3.connect(DB_PATH) as conn:
             state = conn.execute("SELECT value FROM meta WHERE key='cursor'").fetchone()
-            cursor = int(state[0]) if state else 0
-            items, scans = [], []
-            batch = min(max_sources, len(PAGES))
-            for i in range(batch):
-                company, url = PAGES[(cursor+i) % len(PAGES)]
-                code, new = "OK", 0
-                try:
-                    html = get_html(url)
-                    candidates = parse_jobposting(html, url, company)
-                    if not candidates:
-                        candidates = scrapegraph_fallback(html, url, company)
+            cursor = int(state[0]) % len(SOURCE_INVENTORY) if state else 0
+            detail = conn.execute("SELECT company,url,title,location FROM detail_queue WHERE last_checked IS NULL ORDER BY added_utc,url LIMIT 10").fetchall()
+        work = [(SOURCE_INVENTORY[cursor], None)]
+        if max_sources == 2:
+            candidate = next((r for r in detail if approved_detail(r[0], r[1]) and r[1] != work[0][0][3]), None)
+            if candidate:
+                company, url, title, location = candidate
+                work.append(((company,"HTML","",url), {"title":title,"location":location}))
+            else:
+                work.append((SOURCE_INVENTORY[(cursor+1)%len(SOURCE_INVENTORY)], None))
+        advanced = sum(1 for _, expected in work if expected is None)
+        with ThreadPoolExecutor(max_workers=len(work)) as pool:
+            results = list(pool.map(lambda x: safe_scan(*x), work))
+        items, scans, seen = [], [], set()
+        with sqlite3.connect(DB_PATH) as conn:
+            for (source, expected), (code, candidates) in zip(work, results):
+                company, kind, board, url = source
+                new = 0
+                if expected is not None:
+                    conn.execute("UPDATE detail_queue SET last_checked=? WHERE url=?", (timestamp(), url))
+                if code == "OK":
                     for job in candidates:
-                        if len(items) >= 3 or not eligible_hint(job):
+                        if not eligible_hint(job) or job.get("source_url") != url or not allowed_url(job.get("url")):
                             continue
-                        existing = conn.execute("SELECT 1 FROM jobs WHERE url=?", (job["url"],)).fetchone()
-                        if existing:
+                        if kind != "HTML" and approved_detail(company, job["url"]):
+                            conn.execute("INSERT OR IGNORE INTO detail_queue(url,company,title,location,added_utc) VALUES(?,?,?,?,?)",
+                                         (job["url"], company, clean(job["title"],220), clean(job["location"],200), timestamp()))
+                    # Prefer unseen jobs, but allow bounded replay of older records
+                    # so a failed HTTP delivery cannot permanently hide a discovery.
+                    ordered = sorted(candidates, key=lambda j: conn.execute("SELECT 1 FROM jobs WHERE url=?", (j["url"],)).fetchone() is not None)
+                    for job in ordered:
+                        if len(items) >= 3 or job["url"] in seen or job.get("source_url") != url or not allowed_url(job["url"]) or not eligible_hint(job):
                             continue
-                        conn.execute("INSERT INTO jobs(url,first_seen) VALUES(?,?)", (job["url"], timestamp()))
-                        items.append({key: job[key] for key in ("url","company","title","location","source_url","extraction")})
-                        items[-1].update({"checked_utc": timestamp(), "status": "HOLD",
-                                          "blocker": "Original job, timing, prior company history, contact, resume and projects must be independently verified."})
-                        new += 1
-                except PermissionError:
-                    code = "BLOCKED"
-                except Exception:
-                    code = "ERROR"
-                scans.append({"source": url[:300], "status": code, "new": new})
-            cursor = (cursor + batch) % len(PAGES)
-            conn.execute("INSERT INTO meta(key,value) VALUES('cursor',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",(str(cursor),))
-            # Agent Reach runs only via explicit authenticated probe, never inside collection.
-            return {"ok": True, "items": items, "scans": scans, "state": {"sources": len(PAGES), "cursor": cursor}}
+                        seen.add(job["url"])
+                        inserted = conn.execute("INSERT OR IGNORE INTO jobs(url,first_seen) VALUES(?,?)", (job["url"],timestamp())).rowcount
+                        new += int(inserted == 1)
+                        item = {key: job[key] for key in ("url","company","title","location","source_url","extraction")}
+                        item.update({"checked_utc":timestamp(),"status":"HOLD",
+                                     "blocker":"Independent current role, 2027 timing, history, contact, resume and projects still required."})
+                        items.append(item)
+                scans.append({"source":url,"status":code,"new":new})
+            cursor = (cursor + advanced) % len(SOURCE_INVENTORY)
+            conn.execute("INSERT INTO meta(key,value) VALUES('cursor',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (str(cursor),))
+            # Keep local discovery cache bounded. Downstream dedup is authoritative.
+            conn.execute("DELETE FROM detail_queue WHERE url NOT IN (SELECT url FROM detail_queue ORDER BY added_utc DESC,url LIMIT 250)")
+        print(json.dumps({"event":"collect","checked_utc":timestamp(),"scans":scans,"items":len(items)}),flush=True)
+        return {"ok":True,"items":items,"scans":scans,"state":{"sources":len(SOURCE_INVENTORY),"cursor":cursor}}
 
 def installed(module):
     return importlib.util.find_spec(module) is not None
@@ -352,7 +466,7 @@ class Handler(BaseHTTPRequestHandler):
         if self.path != "/healthz":
             return self.json(404, {"ok": False})
         return self.json(200, {
-            "ok": True, "component": "careerops-research-bridge", "version": "1.0",
+            "ok": True, "component": "careerops-research-bridge", "version": "1.1",
             "scrapling_installed": installed("scrapling"),
             "scrapegraphai_installed": installed("scrapegraphai"),
             "agent_reach_installed": shutil.which("agent-reach") is not None,
@@ -407,8 +521,8 @@ class Handler(BaseHTTPRequestHandler):
             request = json.loads(self.rfile.read(length) or b"{}")
             if not isinstance(request, dict) or set(request) - {"max_sources"}:
                 raise ValueError("invalid request")
-            limit = int(request.get("max_sources", 2))
-            if limit < 1 or limit > 2:
+            limit = request.get("max_sources", 2)
+            if type(limit) is not int or limit < 1 or limit > 2:
                 raise ValueError("invalid max_sources")
             return self.json(200, collect(limit))
         except (ValueError, TypeError, json.JSONDecodeError):
