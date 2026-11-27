@@ -305,6 +305,55 @@ def run_agent_probe_background():
         with AGENT_PROBE_LOCK:
             AGENT_PROBE_ACTIVE = False
 
+def structured_model_evidence(html, url, job):
+    """Project literal first-party JSON-LD title and geography; never infer a location."""
+    from scrapling import Selector
+    selector=Selector(html,url=url)
+    for payload in selector.css('script[type="application/ld+json"]::text').getall():
+        try: stack=[json.loads(str(payload))]
+        except (TypeError,ValueError): continue
+        while stack:
+            item=stack.pop()
+            if isinstance(item,list): stack.extend(item); continue
+            if not isinstance(item,dict): continue
+            graph=item.get("@graph")
+            if graph: stack.extend(graph if isinstance(graph,list) else [graph])
+            types=item.get("@type",[])
+            if "JobPosting" not in ([types] if isinstance(types,str) else types if isinstance(types,list) else []): continue
+            if (item.get("url") or url)!=url: continue
+            title=item.get("title")
+            if not isinstance(title,str) or not title.strip() or norm(title)!=norm(job.get("title")): continue
+            def literal(value):
+                if isinstance(value,str) and value.strip(): return safe_text(value,200)
+                if isinstance(value,dict):
+                    v=value.get("name") or value.get("addressCountry")
+                    if isinstance(v,str) and v.strip(): return safe_text(v,200)
+                return ""
+            places=item.get("jobLocation")
+            places=places if isinstance(places,list) else [places]
+            locations=[]
+            for place in places:
+                if isinstance(place,dict):
+                    address=place.get("address")
+                    if isinstance(address,dict):
+                        # Retain explicitly supplied locality, region, country fields.
+                        loc=", ".join(v for v in (literal(address.get("addressLocality")),literal(address.get("addressRegion")),literal(address.get("addressCountry"))) if v)
+                    else: loc=literal(address) or literal(place)
+                else: loc=literal(place)
+                if loc: locations.append(loc)
+            if not locations:
+                req=item.get("applicantLocationRequirements")
+                req=req if isinstance(req,list) else [req]
+                locations=[v for v in (literal(x) for x in req) if v]
+            location="; ".join(dict.fromkeys(locations))
+            title=safe_text(title,220)
+            if not title or not location or len(location)>200: continue
+            # This is a labeled projection of source fields, not a model response.
+            evidence="JobPosting title: "+title+"\nJobPosting location: "+location
+            return {"text":evidence,"expected_title":title,"expected_location":location,"source_kind":"jsonld_projection"}
+    return None
+
+
 def build_model_evidence(html, url, job, expected=None, diagnostic_only=False):
     """Use literal, current employer-page text, not reconstructed JSON-LD fields.
 
@@ -333,6 +382,13 @@ def build_model_evidence(html, url, job, expected=None, diagnostic_only=False):
         excerpt=body[max(0,left-24):min(len(body),right+48)]
         if model_fields_grounded(title,location,url,url,excerpt,[]):
             return {"text":excerpt,"expected_title":title,"expected_location":location}
+    # Some public careers pages render the body via JavaScript but publish exact
+    # JobPosting JSON-LD. The diagnostic can use that real source instead of
+    # fabricating a visible text match. Production retains original strict gate.
+    if diagnostic_only:
+        structured=structured_model_evidence(html,url,job)
+        if structured:
+            return structured
     raise ValueError("ORIGIN_VISIBLE_EVIDENCE_MISSING")
 
 
