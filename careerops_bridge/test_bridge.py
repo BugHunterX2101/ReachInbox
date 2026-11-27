@@ -321,5 +321,42 @@ class RestartSafeSourceTests(unittest.TestCase):
         self.assertTrue(server.eligible_hint(result[0]))
         self.assertFalse(server.detail_evidence("<html><body>No vacancy</body></html>",url,"ATOCONN"))
 
+class ReviewedEmployerSourceTests(unittest.TestCase):
+    def test_single_visible_eligible_card_uses_real_index_url(self):
+        url="https://hyperblox.in/careers/"
+        card='<div class="rounded-xl border border-border bg-card p-6"><div>internship</div><h3>Software Engineering Intern</h3><p>Stipend provided; Flexible hours</p><p>Remote (India)</p></div>'
+        rows=server.detail_evidence("<html><body>"+card+"</body></html>",url,"HyperBlox")
+        self.assertEqual(len(rows),1)
+        self.assertEqual((rows[0]["title"],rows[0]["location"],rows[0]["url"]),("Software Engineering Intern","Remote (India)",url))
+        self.assertEqual(rows[0]["extraction"],"scrapling:origin_visible_text")
+        self.assertTrue(server.eligible_hint(rows[0]))
+        self.assertFalse(server.detail_evidence(card.replace("Remote (India)","Remote"),url,"HyperBlox"))
+        self.assertFalse(server.detail_evidence(card.replace("Flexible hours","Closed"),url,"HyperBlox"))
+        self.assertFalse(server.detail_evidence(card+card.replace("Software Engineering Intern","Data Engineering Intern"),url,"HyperBlox"))
+        self.assertFalse(server.detail_evidence(card,"https://unreviewed.example/careers/","HyperBlox"))
+
+    def test_exact_posting_uses_literal_location_from_role_span(self):
+        url="https://guruvaisciences.org/career/internship-opportunity-build-the-future-of-ai-with-guruvai-sciences"
+        item={"@type":"JobPosting","title":"Internship Opportunity: Build the Future of AI with Guruvai Sciences","url":url,"description":"AI/ML Engineering Internship"}
+        head='<script type="application/ld+json">'+json.dumps(item)+'</script>'
+        role='<span style="font-weight: 400">Location: Hyderabad (Remote work)</span>'
+        rows=server.detail_evidence(head+role,url,"Guruvai Sciences")
+        self.assertEqual(len(rows),1)
+        self.assertEqual(rows[0]["location"],"Hyderabad (Remote work)")
+        self.assertTrue(server.eligible_hint(rows[0]))
+        for body in ("<footer>Hyderabad</footer>",role+"<span>Location: Singapore</span>"):
+            result=server.detail_evidence(head+body,url,"Guruvai Sciences")
+            self.assertEqual(result[0]["location"],"")
+            self.assertFalse(server.eligible_hint(result[0]))
+
+    def test_new_sources_reviewed_without_changing_limits(self):
+        inventory=server.SOURCE_INVENTORY
+        for name,url in (("HyperBlox","https://hyperblox.in/careers/"),("Guruvai Sciences","https://guruvaisciences.org/career/internship-opportunity-build-the-future-of-ai-with-guruvai-sciences")):
+            self.assertIn((name,"HTML","",url),inventory)
+        self.assertNotIn(server.DIAGNOSTIC_ORIGIN[1],[s[3] for s in inventory])
+        with self.assertRaises(ValueError):
+            server.collect(3)
+
+
 if __name__ == "__main__":
     unittest.main()
