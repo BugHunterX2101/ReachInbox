@@ -161,7 +161,7 @@ def parse_jobposting(html, source_url, company):
 
 def scrapegraph_fallback(html, source_url, company):
     """Local model output may corroborate origin text, never invent a job URL."""
-    if os.getenv("ENABLE_SCRAPEGRAPH_AUTO", "false").lower() != "true" or not ollama_ready():
+    if os.getenv("ENABLE_GROUNDED_MODEL_REPLAY", "true").lower() != "true" or not ollama_ready():
         return []
     # The authenticated manual model probe is a prerequisite to production inference.
     with sqlite3.connect(DB_PATH) as conn:
@@ -256,6 +256,8 @@ def run_agent_probe_background():
         with LOCK:
             with sqlite3.connect(DB_PATH) as conn:
                 conn.execute("INSERT INTO meta(key,value) VALUES('agent_reach_result',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (json.dumps(result),))
+                if result.get("status") == "OK" and isinstance(result.get("candidate"), dict):
+                    conn.execute("UPDATE detail_queue SET last_checked=NULL WHERE url=?", (result["candidate"]["url"],))
         print(json.dumps({"event":"agent_probe","status":result.get("status"),"code":result.get("code"),"checked_utc":result.get("checked_utc")}),flush=True)
     finally:
         with AGENT_PROBE_LOCK:
@@ -303,6 +305,8 @@ def run_model_probe_background():
         with LOCK:
             with sqlite3.connect(DB_PATH) as conn:
                 conn.execute("INSERT INTO meta(key,value) VALUES('model_probe_result',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (json.dumps(status),))
+                if status.get("status") == "PASSED" and isinstance(status.get("candidate"), dict):
+                    conn.execute("UPDATE detail_queue SET last_checked=NULL WHERE url=?", (status["candidate"]["url"],))
         print(json.dumps({"event":"model_probe","status":status["status"],"checked_utc":status["checked_utc"]}), flush=True)
         with MODEL_PROBE_LOCK:
             MODEL_PROBE_ACTIVE = False
@@ -398,7 +402,7 @@ def collect(max_sources):
             candidate = next((r for r in detail if approved_detail(r[0], r[1]) and r[1] != work[0][0][3]), None)
             if candidate:
                 company, url, title, location = candidate
-                work.append(((company,"HTML","",url), {"title":title,"location":location}))
+                work.insert(0, ((company,"HTML","",url), {"title":title,"location":location}))
             else:
                 work.append((SOURCE_INVENTORY[(cursor+1)%len(SOURCE_INVENTORY)], None))
         advanced = sum(1 for _, expected in work if expected is None)
