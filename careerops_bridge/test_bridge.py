@@ -275,6 +275,37 @@ class RestartSafeSourceTests(unittest.TestCase):
             self.assertTrue(all(urlsplit(s["source"]).hostname not in server.REVIEW_REQUIRED_HOSTS for s in result["scans"]))
             self.assertTrue(result["scans"])
 
+    def test_verified_receipt_rotation_survives_fresh_database(self):
+        inventory=(
+            ("First","HTML","","https://first.example/careers"),
+            ("Second","HTML","","https://second.example/careers"),
+            ("Third","HTML","","https://third.example/careers"),
+            ("Fourth","HTML","","https://fourth.example/careers"),
+        )
+        previous=[inventory[0][3],inventory[1][3]]
+        with tempfile.TemporaryDirectory() as d,patch.object(server,"DB_PATH",Path(d)/"fresh.sqlite"),patch.object(server,"SOURCE_INVENTORY",inventory),patch.object(server,"safe_scan",return_value=("OK",[])) as scan:
+            server.init_db()
+            result=server.collect(2,[],previous)
+            self.assertEqual([s["source"] for s in result["scans"]],[inventory[2][3],inventory[3][3]])
+            self.assertEqual(result["state"]["cursor"],0)
+            self.assertEqual(scan.call_count,2)
+
+    def test_resume_is_not_a_new_target_and_preserves_access_holds(self):
+        inventory=(
+            ("First","HTML","","https://first.example/careers"),
+            ("Second","HTML","","https://second.example/careers"),
+            ("Third","HTML","","https://third.example/careers"),
+        )
+        self.assertEqual(server.resumed_cursor(inventory,0,[inventory[0][3],"https://unreviewed.example/jobs"]),1)
+        self.assertEqual(server.resumed_cursor(inventory,2,["https://unreviewed.example/jobs"]),2)
+        self.assertEqual(server.resumed_cursor(inventory,1,[inventory[-1][3]]),0)
+        cursor=server.resumed_cursor(inventory,0,[inventory[0][3]])
+        work,_=server.choose_work(inventory,cursor,[],{"host:second.example"},1)
+        self.assertEqual(work[0][0][3],inventory[2][3])
+        for invalid in ("https://first.example/careers",[1],["x"]*3,["x"*301]):
+            with self.assertRaises(ValueError):
+                server.resumed_cursor(inventory,0,invalid)
+
     def test_skips_never_create_network_target(self):
         self.assertEqual(server.validated_source_skips(["https://not-reviewed.example/"]),set())
         with self.assertRaises(ValueError): server.validated_source_skips(["x"]*33)
