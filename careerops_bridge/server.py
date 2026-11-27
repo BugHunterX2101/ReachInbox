@@ -33,13 +33,18 @@ PUBLIC_TIMEOUT = 3.0
 PROBE_TIMEOUT = 10.0
 REQUEST_BUDGET = threading.local()
 PAGES = [
+    ("ATOCONN", "https://www.atoconn.com/vacancies/intern-software-developer/"),
     ("Ubisar", "https://www.ubisar.com/vacancies/tech-intern"),
     ("Tecell", "https://careers.tecell.in/jobs/01a1ff0a-21e8-7e75-bb78-e17358385b66"),
 ]
 # Start with distinct documented providers rather than two boards on the
 # same failing host. Retain all reviewed sources and the Europe/Canada priority.
 _base_inventory = reviewed_inventory(PAGES)
-_preferred = ("Quadrature Capital","Promise Robotics","Fellow Insights Inc.")
+# Review holds are explicit deployment configuration, not ephemeral cursor state.
+# Ashby /robots.txt returned 401; Lever declared pacing requiring review.
+# Do not attempt alternate endpoints or bypass either restriction.
+REVIEW_REQUIRED_HOSTS = frozenset({"api.ashbyhq.com", "api.lever.co"})
+_preferred = ("Quadrature Capital","ATOCONN","Isomorphic Labs")
 SOURCE_INVENTORY = tuple(s for name in _preferred for s in _base_inventory if s[0]==name) + tuple(s for s in _base_inventory if s[0] not in _preferred and s[0]!="Ubisar")
 DB_PATH = Path(os.environ.get("CAREEROPS_DB", "/tmp/careerops.sqlite"))
 LOCK = threading.RLock()
@@ -242,6 +247,19 @@ def detail_evidence(html, source_url, company, expected=None):
     out = [j for j in out if j.get("url") == source_url]
     if out:
         return out
+    if (company, source_url)==("ATOCONN","https://www.atoconn.com/vacancies/intern-software-developer/"):
+        from scrapling import Selector
+        sel=Selector(html,url=source_url)
+        titles=[clean(x,220) for x in sel.css("h1").getall() if clean(x,220)]
+        body=visible_text(html,source_url)
+        # Exact role labels on the original employer vacancy. No supplied
+        # expected title or location is substituted into the output.
+        role=re.search(r"\bRole:\s*(.{3,180}?)\s+Location:",body,re.I)
+        place=re.search(r"\bLocation:\s*(.{3,180}?)\s+Experience:",body,re.I)
+        if role and place:
+            title=clean(role.group(1),220);location=clean(place.group(1),200)
+            if title and location and any(norm(x)==norm(title) for x in titles):
+                return [{"url":source_url,"title":title,"location":location,"company":company,"source_url":source_url,"extraction":"scrapling:origin_visible_text","description":body[:16000]}]
     if expected and (approved_detail(company, source_url) or (company, source_url) == DIAGNOSTIC_ORIGIN[:2]):
         body = visible_text(html, source_url)
         if model_fields_grounded(expected["title"], expected["location"], source_url, source_url, body, []):
@@ -576,7 +594,18 @@ def choose_work(inventory, cursor, detail, blocked, max_sources):
     return work,next_cursor
 
 
-def collect(max_sources):
+def validated_source_skips(raw):
+    """Client history can only REMOVE exact approved sources; never introduce a fetch."""
+    if not isinstance(raw,list) or len(raw)>32 or any(not isinstance(x,str) or len(x)>300 for x in raw):
+        raise ValueError("INVALID_SOURCE_SKIPS")
+    reviewed={s[3] for s in SOURCE_INVENTORY}
+    # Historical inventory may change. Unknown entries have no effect; they
+    # are never used as a destination, redirect, probe target, or fetch URL.
+    return {x for x in raw if x in reviewed}
+
+
+def collect(max_sources, skip_sources=None):
+    durable_skips=validated_source_skips([] if skip_sources is None else skip_sources)
     if type(max_sources) is not int or not 1 <= max_sources <= 2:
         raise ValueError("INVALID_LIMIT")
     with LOCK:
@@ -585,6 +614,8 @@ def collect(max_sources):
             cursor = int(state[0]) % len(SOURCE_INVENTORY) if state else 0
             detail = conn.execute("SELECT company,url,title,location FROM detail_queue WHERE last_checked IS NULL ORDER BY added_utc,url LIMIT 10").fetchall()
             blocked = {r[0] for r in conn.execute("SELECT url FROM source_cooldown WHERE until_epoch>?",(time.time(),))}
+        blocked.update(durable_skips)
+        blocked.update("host:"+h for h in REVIEW_REQUIRED_HOSTS)
         work,cursor=choose_work(SOURCE_INVENTORY,cursor,detail,blocked,max_sources)
         if not work:
             return {"ok":True,"items":[],"scans":[],"state":{"sources":len(SOURCE_INVENTORY),"cursor":cursor}}
@@ -700,15 +731,15 @@ class Handler(BaseHTTPRequestHandler):
             return self.json(202, {"ok": True, "agent_reach": {"status": "RUNNING", "items": 0}})
         try:
             length = int(self.headers.get("Content-Length", "0"))
-            if length < 0 or length > 2048:
+            if length < 0 or length > 8192:
                 return self.json(413, {"ok": False, "error": "too_large"})
             request = json.loads(self.rfile.read(length) or b"{}")
-            if not isinstance(request, dict) or set(request) - {"max_sources"}:
+            if not isinstance(request, dict) or set(request) - {"max_sources","skip_sources"}:
                 raise ValueError("invalid request")
             limit = request.get("max_sources", 2)
             if type(limit) is not int or limit < 1 or limit > 2:
                 raise ValueError("invalid max_sources")
-            return self.json(200, collect(limit))
+            return self.json(200, collect(limit, request.get("skip_sources", [])))
         except (ValueError, TypeError, json.JSONDecodeError):
             return self.json(400, {"ok": False, "error": "bad_request"})
         except Exception:
