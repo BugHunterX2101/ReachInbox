@@ -34,6 +34,8 @@ DB_PATH = Path(os.environ.get("CAREEROPS_DB", "/tmp/careerops.sqlite"))
 LOCK = threading.RLock()
 AGENT_PROBE_LOCK = threading.Lock()
 AGENT_PROBE_ACTIVE = False
+MODEL_PROBE_LOCK = threading.Lock()
+MODEL_PROBE_ACTIVE = False
 
 class NoRedirect(HTTPRedirectHandler):
     def redirect_request(self, req, fp, code, msg, headers, newurl):
@@ -138,6 +140,9 @@ def parse_jobposting(html, source_url, company):
     return out
 
 def scrapegraph_fallback(html, source_url, company):
+    # Never make public collection wait on unverified local inference.
+    if os.getenv("ENABLE_SCRAPEGRAPH_AUTO", "false").lower() != "true":
+        return []
     if os.getenv("ENABLE_LOCAL_SCRAPEGRAPHAI", "false").lower() != "true":
         return []
     base, model = os.getenv("OLLAMA_BASE_URL", ""), os.getenv("OLLAMA_MODEL", "")
@@ -212,15 +217,55 @@ def run_agent_probe_background():
         with AGENT_PROBE_LOCK:
             AGENT_PROBE_ACTIVE = False
 
+def run_model_probe_background():
+    """One manual bounded test of the real SmartScraperGraph class and local Ollama."""
+    global MODEL_PROBE_ACTIVE
+    status = {"status": "FAILED", "verified_title": False, "checked_utc": timestamp()}
+    try:
+        proc = subprocess.run(
+            ["python", "/app/model_probe.py"], capture_output=True, text=True,
+            timeout=110, check=False,
+        )
+        try:
+            info = json.loads(proc.stdout[-1600:])
+        except (ValueError, TypeError):
+            info = {"status": "INVALID_RESULT"}
+        if proc.returncode == 0 and info.get("status") == "PASSED" and info.get("verified_title") is True:
+            status["status"] = "PASSED"
+            status["verified_title"] = True
+        elif info.get("status") == "UNRELIABLE_OUTPUT":
+            status["status"] = "UNRELIABLE_OUTPUT"
+        else:
+            status["status"] = "FAILED"
+            status["error_type"] = str(info.get("error_type") or "PROBE_FAILED")[:90]
+    except subprocess.TimeoutExpired:
+        status["status"] = "TIMEOUT"
+    except Exception as exc:
+        status["status"] = "FAILED"
+        status["error_type"] = type(exc).__name__
+    finally:
+        with LOCK:
+            with sqlite3.connect(DB_PATH) as conn:
+                conn.execute("INSERT INTO meta(key,value) VALUES('model_probe_result',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (json.dumps(status),))
+        with MODEL_PROBE_LOCK:
+            MODEL_PROBE_ACTIVE = False
+
 def get_adapter_status():
     with sqlite3.connect(DB_PATH) as conn:
         row = conn.execute("SELECT value FROM meta WHERE key='agent_reach_result'").fetchone()
+        model = conn.execute("SELECT value FROM meta WHERE key='model_probe_result'").fetchone()
     try:
         agent = json.loads(row[0]) if row else None
     except (ValueError, TypeError):
         agent = None
+    try:
+        probe = json.loads(model[0]) if model else None
+    except (ValueError, TypeError):
+        probe = None
+    ready = ollama_ready()
     return {"ok": True, "agent_reach": agent or {"status": "NOT_TESTED", "items": 0},
-            "scrapegraphai": {"status": "MODEL_READY" if ollama_ready() else "NO_LOCAL_MODEL"},
+            "scrapegraphai": probe if ready and probe else
+                {"status": "MODEL_READY_NOT_TESTED" if ready else "NO_LOCAL_MODEL"},
             "checked_utc": timestamp()}
 
 def ollama_ready():
@@ -315,12 +360,29 @@ class Handler(BaseHTTPRequestHandler):
             "gmail_write_capable": False, "sheet_write_capable": False, "schedule_created": False
         })
     def do_POST(self):
-        if self.path not in ("/v1/collect", "/v1/agent-probe"):
+        if self.path not in ("/v1/collect", "/v1/agent-probe", "/v1/model-probe"):
             return self.json(404, {"ok": False})
         expected = os.getenv("CAREEROPS_BRIDGE_TOKEN", "")
         supplied = self.headers.get("X-CareerOps-Token", "")
         if len(expected) < 32 or not hmac.compare_digest(expected, supplied):
             return self.json(403, {"ok": False, "error": "unauthorized"})
+        if self.path == "/v1/model-probe":
+            if not ollama_ready():
+                return self.json(409, {"ok": False, "error": "LOCAL_OLLAMA_MODEL_NOT_READY"})
+            with MODEL_PROBE_LOCK:
+                global MODEL_PROBE_ACTIVE
+                if MODEL_PROBE_ACTIVE:
+                    return self.json(202, {"ok": True, "scrapegraphai": {"status": "RUNNING"}})
+                with LOCK:
+                    with sqlite3.connect(DB_PATH) as conn:
+                        last = conn.execute("SELECT value FROM meta WHERE key='model_probe_checked'").fetchone()
+                        if last and time.time() - float(last[0]) < 300:
+                            return self.json(200, get_adapter_status())
+                        conn.execute("INSERT INTO meta(key,value) VALUES('model_probe_checked',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (str(time.time()),))
+                        conn.execute("INSERT INTO meta(key,value) VALUES('model_probe_result',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (json.dumps({"status": "RUNNING", "checked_utc": timestamp()}),))
+                MODEL_PROBE_ACTIVE = True
+            threading.Thread(target=run_model_probe_background, daemon=True, name="scrapegraph-one-shot").start()
+            return self.json(202, {"ok": True, "scrapegraphai": {"status": "RUNNING"}})
         if self.path == "/v1/agent-probe":
             if os.getenv("ENABLE_AGENT_REACH_PUBLIC", "false").lower() != "true":
                 return self.json(409, {"ok": False, "error": "disabled"})
