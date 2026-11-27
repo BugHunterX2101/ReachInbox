@@ -305,6 +305,37 @@ def run_agent_probe_background():
         with AGENT_PROBE_LOCK:
             AGENT_PROBE_ACTIVE = False
 
+def build_model_evidence(html, url, job, expected=None, diagnostic_only=False):
+    """Use literal, current employer-page text, not reconstructed JSON-LD fields.
+
+    A diagnostic fixture can name an independently reviewed visible title/location;
+    both must be found verbatim (case/whitespace normalized) on the fetched page.
+    The model receives only a contiguous excerpt, not the expected answer.
+    """
+    body = visible_text(html, url)
+    pairs = [(job.get("title"), job.get("location"))]
+    if diagnostic_only and isinstance(expected, dict):
+        pairs.insert(0, (expected.get("title"), expected.get("location")))
+    for title,location in pairs:
+        if not isinstance(title,str) or not isinstance(location,str) or not title or not location:
+            continue
+        if not model_fields_grounded(title,location,url,url,body,[]):
+            continue
+        # Choose the nearest pair of exact source occurrences, not an unrelated
+        # country name in the page's navigation. A short contiguous excerpt
+        # preserves original evidence and order.
+        starts = [m.start() for m in re.finditer(re.escape(title),body,re.I)]
+        locations = [m.start() for m in re.finditer(re.escape(location),body,re.I)]
+        spans = [(min(a,b),max(a+len(title),b+len(location))) for a in starts for b in locations]
+        if not spans: continue
+        left,right=min(spans,key=lambda span:span[1]-span[0])
+        if right-left>600: continue
+        excerpt=body[max(0,left-24):min(len(body),right+48)]
+        if model_fields_grounded(title,location,url,url,excerpt,[]):
+            return {"text":excerpt,"expected_title":title,"expected_location":location}
+    raise ValueError("ORIGIN_VISIBLE_EVIDENCE_MISSING")
+
+
 def run_model_probe_background():
     """A bounded genuine-source local-model probe, triggered only by authorized request."""
     global MODEL_PROBE_ACTIVE
@@ -318,20 +349,8 @@ def run_model_probe_background():
             raise ValueError("ORIGIN_EVIDENCE_MISSING")
         job = jobs[0]
         record_scrapling_proof(job)
-        body = visible_text(html, url)
-        if not model_fields_grounded(job["title"], job["location"], url, url, body, []):
-            raise ValueError("ORIGIN_VISIBLE_EVIDENCE_MISSING")
-        # Pass only bounded origin text, not any credentials or external URL.
-        # Select short actual source excerpts, not inserted expected values.
-        # Keeps the 135M model within the free CPU/memory context budget.
-        snippets = []
-        for value in (job["title"],job["location"]):
-            pos = body.casefold().find(value.casefold())
-            if pos >= 0:
-                snippets.append(body[max(0,pos-24):pos+len(value)+48])
-        data = {"text": " ".join(snippets)[:700], "expected_title": job["title"], "expected_location": job["location"]}
-        if not model_fields_grounded(job["title"], job["location"], url, url, data["text"], []):
-            raise ValueError("BOUNDED_EVIDENCE_MISSING")
+        diagnostic_only = (company,url) == DIAGNOSTIC_ORIGIN[:2]
+        data = build_model_evidence(html,url,job,expected,diagnostic_only)
         env = {k: v for k, v in os.environ.items() if k in {"PATH","HOME","LANG","LC_ALL","OLLAMA_BASE_URL","OLLAMA_MODEL","OLLAMA_HOST","OLLAMA_CONTEXT_LENGTH"}}
         proc = subprocess.run(["python", "/app/model_probe.py"], input=json.dumps(data),
                               capture_output=True, text=True, timeout=110, check=False, env=env)
