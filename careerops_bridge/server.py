@@ -179,7 +179,7 @@ def agent_reach_discovery():
     if os.getenv("ENABLE_AGENT_REACH_PUBLIC", "false").lower() != "true":
         return {"status": "DISABLED", "checked_utc": checked, "items": 0, "code": "FLAG_OFF"}
     # A public GitHub README is a stable verification target; not contact harvesting.
-    cmd = ["agent-reach", "read", "https://github.com/D4Vinci/Scrapling", "--backend", "public-web"]
+    cmd = ["agent-reach", "web", "read", "https://github.com/D4Vinci/Scrapling", "--backend", "jina"]
     try:
         proc = subprocess.run(cmd, capture_output=True, text=True, timeout=25, check=False)
     except subprocess.TimeoutExpired:
