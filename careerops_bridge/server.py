@@ -32,6 +32,8 @@ PAGES = [
 ]
 DB_PATH = Path(os.environ.get("CAREEROPS_DB", "/tmp/careerops.sqlite"))
 LOCK = threading.RLock()
+AGENT_PROBE_LOCK = threading.Lock()
+AGENT_PROBE_ACTIVE = False
 
 class NoRedirect(HTTPRedirectHandler):
     def redirect_request(self, req, fp, code, msg, headers, newurl):
@@ -179,7 +181,7 @@ def agent_reach_discovery():
     # A public GitHub README is a stable verification target; not contact harvesting.
     cmd = ["agent-reach", "read", "https://github.com/D4Vinci/Scrapling", "--backend", "public-web"]
     try:
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=5, check=False)
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=25, check=False)
     except subprocess.TimeoutExpired:
         return {"status": "TIMEOUT", "checked_utc": checked, "items": 0, "code": "CLI_TIMEOUT"}
     except FileNotFoundError:
@@ -197,6 +199,18 @@ def agent_reach_discovery():
     if code in {"RATE_LIMITED", "PLATFORM_BLOCKED", "NEED_LOGIN", "BUSY"}:
         return {"status": "BLOCKED", "checked_utc": checked, "items": 0, "code": code}
     return {"status": "UNAVAILABLE", "checked_utc": checked, "items": 0, "code": code or "NO_PUBLIC_ITEMS"}
+
+def run_agent_probe_background():
+    """Only an authenticated request starts this; never a scheduler."""
+    global AGENT_PROBE_ACTIVE
+    try:
+        result = agent_reach_discovery()
+        with LOCK:
+            with sqlite3.connect(DB_PATH) as conn:
+                conn.execute("INSERT INTO meta(key,value) VALUES('agent_reach_result',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (json.dumps(result),))
+    finally:
+        with AGENT_PROBE_LOCK:
+            AGENT_PROBE_ACTIVE = False
 
 def get_adapter_status():
     with sqlite3.connect(DB_PATH) as conn:
@@ -310,16 +324,20 @@ class Handler(BaseHTTPRequestHandler):
         if self.path == "/v1/agent-probe":
             if os.getenv("ENABLE_AGENT_REACH_PUBLIC", "false").lower() != "true":
                 return self.json(409, {"ok": False, "error": "disabled"})
-            with LOCK:
-                with sqlite3.connect(DB_PATH) as conn:
-                    previous = conn.execute("SELECT value FROM meta WHERE key='agent_reach_checked'").fetchone()
-                    if previous and time.time() - float(previous[0]) < 300:
-                        return self.json(200, get_adapter_status())
-                result = agent_reach_discovery()
-                with sqlite3.connect(DB_PATH) as conn:
-                    conn.execute("INSERT INTO meta(key,value) VALUES('agent_reach_checked',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (str(time.time()),))
-                    conn.execute("INSERT INTO meta(key,value) VALUES('agent_reach_result',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (json.dumps(result),))
-            return self.json(200, get_adapter_status())
+            with AGENT_PROBE_LOCK:
+                global AGENT_PROBE_ACTIVE
+                if AGENT_PROBE_ACTIVE:
+                    return self.json(202, {"ok": True, "agent_reach": {"status": "RUNNING", "items": 0}})
+                with LOCK:
+                    with sqlite3.connect(DB_PATH) as conn:
+                        prev = conn.execute("SELECT value FROM meta WHERE key='agent_reach_checked'").fetchone()
+                        if prev and time.time() - float(prev[0]) < 300:
+                            return self.json(200, get_adapter_status())
+                        conn.execute("INSERT INTO meta(key,value) VALUES('agent_reach_checked',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (str(time.time()),))
+                        conn.execute("INSERT INTO meta(key,value) VALUES('agent_reach_result',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (json.dumps({"status": "RUNNING", "checked_utc": timestamp(), "items": 0}),))
+                AGENT_PROBE_ACTIVE = True
+            threading.Thread(target=run_agent_probe_background, daemon=True, name="agent-reach-one-shot").start()
+            return self.json(202, {"ok": True, "agent_reach": {"status": "RUNNING", "items": 0}})
         try:
             length = int(self.headers.get("Content-Length", "0"))
             if length < 0 or length > 2048:
