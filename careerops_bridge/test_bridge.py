@@ -207,5 +207,34 @@ class ModelEvidenceTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError,"ORIGIN_VISIBLE_EVIDENCE_MISSING"):
             server.build_model_evidence(html,url,{"title":"Other Role","location":"London"},expected,False)
 
+class StructuredModelEvidenceTests(unittest.TestCase):
+    def test_real_structured_fields_for_diagnostic_only(self):
+        company,url,expected=server.DIAGNOSTIC_ORIGIN
+        source={"@type":"JobPosting","url":url,"title":"Tech Intern","jobLocation":{"address":{"addressCountry":"India"}},"description":"A published vacancy"}
+        html='<html><head><script type="application/ld+json">'+json.dumps(source)+'</script></head><body>Careers</body></html>'
+        job={"title":"Tech Intern","location":"India"}
+        data=server.build_model_evidence(html,url,job,expected,True)
+        self.assertEqual(data["source_kind"],"jsonld_projection")
+        self.assertEqual(data["expected_title"],"Tech Intern")
+        self.assertEqual(data["expected_location"],"India")
+        with self.assertRaisesRegex(ValueError,"ORIGIN_VISIBLE_EVIDENCE_MISSING"):
+            server.build_model_evidence(html,url,job,expected,False)
+
+    def test_remote_country_from_explicit_applicant_location(self):
+        company,url,expected=server.DIAGNOSTIC_ORIGIN
+        source={"@type":"JobPosting","url":url,"title":"Tech Intern","jobLocationType":"TELECOMMUTE","applicantLocationRequirements":{"@type":"Country","name":"India"}}
+        html='<script type="application/ld+json">'+json.dumps(source)+'</script>'
+        data=server.structured_model_evidence(html,url,{"title":"Tech Intern"})
+        self.assertEqual(data["expected_location"],"India")
+        del source["applicantLocationRequirements"]
+        html='<script type="application/ld+json">'+json.dumps(source)+'</script>'
+        self.assertIsNone(server.structured_model_evidence(html,url,{"title":"Tech Intern"}))
+
+    def test_reject_unrelated_posting(self):
+        company,url,expected=server.DIAGNOSTIC_ORIGIN
+        source={"@type":"JobPosting","url":"https://www.ubisar.com/unrelated","title":"Tech Intern","jobLocation":"India"}
+        html='<script type="application/ld+json">'+json.dumps(source)+'</script>'
+        self.assertIsNone(server.structured_model_evidence(html,url,{"title":"Tech Intern"}))
+
 if __name__ == "__main__":
     unittest.main()
