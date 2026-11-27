@@ -108,11 +108,11 @@ class CollectorTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 server.collect(invalid)
         rows=[row(url="https://jobs.ashbyhq.com/Abound/aaaaaaaa-bbbb-cccc-dddd-"+str(i).zfill(12)) for i in range(8)]
-        with patch.object(server,"get_json",side_effect=lambda url:envelope(rows) if url==FEED[3] else envelope([])):
+        with patch.object(server,"SOURCE_INVENTORY",(FEED,adapters.APPROVED_FEEDS[6])),patch.object(server,"get_json",side_effect=lambda url:envelope(rows) if url==FEED[3] else envelope([])):
             result=server.collect(2)
-        self.assertLessEqual(len(result["items"]),3)
+        self.assertEqual(len(result["items"]),3)
         self.assertTrue(all(i["status"]=="HOLD" for i in result["items"]))
-        self.assertEqual(result["state"]["sources"],len(server.SOURCE_INVENTORY))
+        self.assertEqual(result["state"]["sources"],2)
 
 
 class AccessPolicyTests(unittest.TestCase):
