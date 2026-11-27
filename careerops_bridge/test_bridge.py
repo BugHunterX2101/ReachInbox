@@ -187,5 +187,25 @@ class SourceRotationTests(unittest.TestCase):
                 second=server.collect(2)
             self.assertTrue({s["source"] for s in first["scans"]}.isdisjoint({s["source"] for s in second["scans"]}))
 
+class ModelEvidenceTests(unittest.TestCase):
+    def test_visible_diagnostic_pair_can_differ_from_jsonld_location(self):
+        company,url,expected=server.DIAGNOSTIC_ORIGIN
+        html="<html><body><nav>India France Canada</nav><main><h1>Tech Intern</h1><p>India - Remote</p></main></body></html>"
+        job={"title":"Tech Intern","location":"Remote, India"}
+        data=server.build_model_evidence(html,url,job,expected,True)
+        self.assertEqual(data["expected_location"],"India - Remote")
+        self.assertIn("Tech Intern India - Remote",data["text"])
+
+    def test_never_invents_missing_visible_fields(self):
+        company,url,expected=server.DIAGNOSTIC_ORIGIN
+        with self.assertRaisesRegex(ValueError,"ORIGIN_VISIBLE_EVIDENCE_MISSING"):
+            server.build_model_evidence("<html><body>Careers</body></html>",url,{"title":"Tech Intern","location":"Remote, India"},expected,True)
+
+    def test_production_model_requires_actual_job_fields(self):
+        company,url,expected=server.DIAGNOSTIC_ORIGIN
+        html="<html><body>Tech Intern India - Remote</body></html>"
+        with self.assertRaisesRegex(ValueError,"ORIGIN_VISIBLE_EVIDENCE_MISSING"):
+            server.build_model_evidence(html,url,{"title":"Other Role","location":"London"},expected,False)
+
 if __name__ == "__main__":
     unittest.main()
