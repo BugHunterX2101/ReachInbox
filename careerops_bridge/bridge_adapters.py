@@ -180,3 +180,24 @@ def model_fields_grounded(title, location, url, source_url, visible_text, allowe
         return False
     t, loc, body = norm(title), norm(location), norm(visible_text)
     return bool(t and loc and t in body and loc in body and (url == source_url or url in allowed_links))
+
+
+def reviewed_inventory(html_seeds):
+    """Europe/Canada-first approved feed snapshot plus reviewed HTML seed pages."""
+    feeds = [(company, ats, board, url) for company, ats, board, url in APPROVED_FEEDS]
+    pages = [(company, "HTML", "", url) for company, url in html_seeds]
+    return tuple(feeds + pages)
+
+
+def source_candidates(source, fetch_json, fetch_html, parse_html, model_fallback):
+    """One reviewed source; never switch backend after a blocked/failed origin."""
+    company, kind, board, url = source
+    if kind != "HTML":
+        if source not in APPROVED_FEEDS:
+            raise ValueError("UNREVIEWED_FEED")
+        return parse_feed(fetch_json(url), company, kind, board, url)
+    html = fetch_html(url)
+    jobs = parse_html(html, url, company)
+    if not jobs:
+        jobs = model_fallback(html, url, company)
+    return [job for job in jobs if eligible_hint(job.get("title"), job.get("location"), job.get("description", ""))]
