@@ -27,6 +27,10 @@ COPY --from=ollama-cpu /usr/lib/ollama /usr/lib/ollama
 WORKDIR /app
 COPY requirements.txt ./
 RUN pip install -r requirements.txt && pip install uv
+# v1.76.0's legacy ChatOllama import is fixed upstream (PR #1076).
+# Backport only that import on the installed Python 3.11-compatible release.
+RUN python -c 'import importlib.metadata as m, importlib.util as u; from pathlib import Path; assert m.version("scrapegraphai")=="1.76.0"; root=Path(u.find_spec("scrapegraphai").origin).parent; files=[p for p in root.rglob("*.py") if "from langchain_community.chat_models import ChatOllama" in p.read_text()]; assert files; [(p.write_text(p.read_text().replace("from langchain_community.chat_models import ChatOllama","from langchain_ollama import ChatOllama"))) for p in files]; print("Patched upstream ChatOllama import:",len(files))'
+RUN python -c 'from scrapegraphai.graphs import SmartScraperGraph; from langchain_ollama import ChatOllama; print("SCRAPEGRAPHAI_IMPORT_OK")'
 RUN uv tool install https://github.com/Panniantong/Agent-Reach/releases/download/v1.6.1/agent-reach.zip
 RUN mkdir -p /opt/ollama/models && \
     (ollama serve >/tmp/ollama-build.log 2>&1 & echo $! >/tmp/ollama-build.pid) && \
