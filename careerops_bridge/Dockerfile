@@ -18,7 +18,9 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     OLLAMA_CONTEXT_LENGTH=512 \
     OLLAMA_KEEP_ALIVE=0 \
     ENABLE_LOCAL_SCRAPEGRAPHAI=true \
-    ENABLE_SCRAPEGRAPH_AUTO=false
+    ENABLE_SCRAPEGRAPH_AUTO=false \
+    ENABLE_GROUNDED_MODEL_REPLAY=true \
+    ENABLE_AGENT_REACH_PUBLIC=true
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl git libstdc++6 libgomp1 && rm -rf /var/lib/apt/lists/*
 COPY --from=ollama-cpu /usr/bin/ollama /usr/bin/ollama
 COPY --from=ollama-cpu /usr/lib/ollama /usr/lib/ollama
@@ -32,8 +34,11 @@ RUN mkdir -p /opt/ollama/models && \
     ollama pull smollm2:135m-instruct-q4_0 && \
     kill $(cat /tmp/ollama-build.pid) && \
     chmod -R a+rX /opt/ollama/models
+COPY bridge_adapters.py ./bridge_adapters.py
 COPY server.py ./server.py
 COPY model_probe.py ./model_probe.py
+COPY test_bridge.py ./test_bridge.py
+RUN python -m py_compile server.py bridge_adapters.py model_probe.py && python -m unittest -v test_bridge
 COPY start.sh ./start.sh
 RUN useradd -u 10001 -m careerops && \
     chown -R careerops:careerops /opt/ollama/models && \
