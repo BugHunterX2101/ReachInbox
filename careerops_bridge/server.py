@@ -422,6 +422,7 @@ def run_model_probe_background():
                 status["candidate"] = {k: job[k] for k in ("url","company","title","location","source_url")}
         elif info.get("status") == "UNRELIABLE_OUTPUT":
             status["status"] = "UNRELIABLE_OUTPUT"
+            status["code"] = str(info.get("code") or "MODEL_OUTPUT_REJECTED")[:90]
         else:
             status["error_type"] = str(info.get("error_type") or "PROBE_FAILED")[:90]
     except (subprocess.TimeoutExpired, TimeoutError) as exc:
@@ -433,12 +434,17 @@ def run_model_probe_background():
     except Exception as exc:
         status["error_type"] = public_failure(exc)
     finally:
+        status["checked_utc"] = timestamp()
+        if "code" not in status and status.get("error_type"):
+            status["code"] = status["error_type"]
+        status["verified_title"] = status.get("verified_title") is True
+        status["verified_location"] = status.get("verified_location") is True
         with LOCK:
             with sqlite3.connect(DB_PATH) as conn:
                 conn.execute("INSERT INTO meta(key,value) VALUES('model_probe_result',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (json.dumps(status),))
                 if status.get("status") == "PASSED" and isinstance(status.get("candidate"), dict):
                     conn.execute("UPDATE detail_queue SET last_checked=NULL WHERE url=?", (status["candidate"]["url"],))
-        print(json.dumps({"event":"model_probe","status":status["status"],"code":status.get("error_type"),"verified_title":status.get("verified_title",False),"verified_location":status.get("verified_location",False),"checked_utc":status["checked_utc"]}), flush=True)
+        print(json.dumps({"event":"model_probe","status":status["status"],"code":status.get("code"),"verified_title":status.get("verified_title",False),"verified_location":status.get("verified_location",False),"checked_utc":status["checked_utc"]}), flush=True)
         with MODEL_PROBE_LOCK:
             MODEL_PROBE_ACTIVE = False
 
