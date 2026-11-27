@@ -236,5 +236,29 @@ class StructuredModelEvidenceTests(unittest.TestCase):
         html='<script type="application/ld+json">'+json.dumps(source)+'</script>'
         self.assertIsNone(server.structured_model_evidence(html,url,{"title":"Tech Intern"}))
 
+class LocalModelContractTests(unittest.TestCase):
+    def test_schema_is_source_derived_and_allows_abstention(self):
+        from model_probe import output_schema
+        source="JobPosting title: Backend Engineer\nJobPosting location: Dublin\nDepartment: Engineering"
+        schema=output_schema(source)
+        self.assertEqual(schema["properties"]["title"]["enum"],schema["properties"]["location"]["enum"])
+        self.assertEqual(set(schema["properties"]["title"]["enum"]),{"Backend Engineer","Dublin","Engineering",""})
+        self.assertFalse(schema["additionalProperties"])
+
+    def test_model_output_is_never_repaired_from_expected_values(self):
+        from model_probe import verify_result
+        correct=verify_result({"title":"Backend Engineer","location":"Dublin"},"Backend Engineer","Dublin","JSON_RETURNED")
+        self.assertEqual(correct["status"],"PASSED")
+        wrong=verify_result({"title":"Dublin","location":"Backend Engineer"},"Backend Engineer","Dublin","JSON_RETURNED")
+        self.assertEqual(wrong["status"],"UNRELIABLE_OUTPUT")
+        missing=verify_result({"title":"Backend Engineer"},"Backend Engineer","Dublin","JSON_RETURNED")
+        self.assertFalse(missing["verified_title"])
+        self.assertFalse(missing["verified_location"])
+
+    def test_model_transport_forbids_nonlocal_endpoint(self):
+        from model_probe import local_extract
+        with self.assertRaisesRegex(ValueError,"LOCAL_OLLAMA_ONLY"):
+            local_extract("test","https://example.com","model")
+
 if __name__ == "__main__":
     unittest.main()
