@@ -604,7 +604,25 @@ def validated_source_skips(raw):
     return {x for x in raw if x in reviewed}
 
 
-def collect(max_sources, skip_sources=None):
+def resumed_cursor(inventory, fallback, raw):
+    """Resume after the latest recognized, receipt-ordered source; never add targets.
+
+    The owner dashboard supplies at most two source URLs from its latest
+    independently verified receipt. A free-instance restart may erase SQLite.
+    Unknown URLs (including detail-only URLs) have no network effect.
+    """
+    if raw is None:
+        return fallback
+    if not isinstance(raw, list) or len(raw) > 2 or any(not isinstance(x, str) or len(x) > 300 for x in raw):
+        raise ValueError("INVALID_RESUME_SOURCES")
+    positions = {source[3]: i for i, source in enumerate(inventory)}
+    for url in reversed(raw):
+        if url in positions:
+            return (positions[url] + 1) % len(inventory)
+    return fallback
+
+
+def collect(max_sources, skip_sources=None, resume_after_sources=None):
     durable_skips=validated_source_skips([] if skip_sources is None else skip_sources)
     if type(max_sources) is not int or not 1 <= max_sources <= 2:
         raise ValueError("INVALID_LIMIT")
@@ -612,6 +630,7 @@ def collect(max_sources, skip_sources=None):
         with sqlite3.connect(DB_PATH) as conn:
             state = conn.execute("SELECT value FROM meta WHERE key='cursor'").fetchone()
             cursor = int(state[0]) % len(SOURCE_INVENTORY) if state else 0
+            cursor = resumed_cursor(SOURCE_INVENTORY, cursor, resume_after_sources)
             detail = conn.execute("SELECT company,url,title,location FROM detail_queue WHERE last_checked IS NULL ORDER BY added_utc,url LIMIT 10").fetchall()
             blocked = {r[0] for r in conn.execute("SELECT url FROM source_cooldown WHERE until_epoch>?",(time.time(),))}
         blocked.update(durable_skips)
@@ -734,12 +753,12 @@ class Handler(BaseHTTPRequestHandler):
             if length < 0 or length > 8192:
                 return self.json(413, {"ok": False, "error": "too_large"})
             request = json.loads(self.rfile.read(length) or b"{}")
-            if not isinstance(request, dict) or set(request) - {"max_sources","skip_sources"}:
+            if not isinstance(request, dict) or set(request) - {"max_sources","skip_sources","resume_after_sources"}:
                 raise ValueError("invalid request")
             limit = request.get("max_sources", 2)
             if type(limit) is not int or limit < 1 or limit > 2:
                 raise ValueError("invalid max_sources")
-            return self.json(200, collect(limit, request.get("skip_sources", [])))
+            return self.json(200, collect(limit, request.get("skip_sources", []), request.get("resume_after_sources")))
         except (ValueError, TypeError, json.JSONDecodeError):
             return self.json(400, {"ok": False, "error": "bad_request"})
         except Exception:
