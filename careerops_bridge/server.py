@@ -172,16 +172,57 @@ def eligible_hint(job):
     return india
 
 def agent_reach_discovery():
-    """Optional one-per-day anonymous public-web discovery, not a source scan."""
+    """One explicit, read-only public-web probe. Never asks for logins or uses account sessions."""
+    checked = timestamp()
     if os.getenv("ENABLE_AGENT_REACH_PUBLIC", "false").lower() != "true":
-        return "DISABLED"
-    proc = subprocess.run(
-        ["agent-reach", "web", "search", "2027 graduate software engineer UK Canada employer careers", "--limit", "5", "--backend", "public-web"],
-        capture_output=True, text=True, timeout=12, check=False)
-    if proc.returncode != 0:
-        return "UNAVAILABLE"
-    data = json.loads(proc.stdout)
-    return "OK" if data.get("ok") else "UNAVAILABLE"
+        return {"status": "DISABLED", "checked_utc": checked, "items": 0, "code": "FLAG_OFF"}
+    # A public GitHub README is a stable verification target; not contact harvesting.
+    cmd = ["agent-reach", "read", "https://github.com/D4Vinci/Scrapling", "--backend", "public-web"]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=5, check=False)
+    except subprocess.TimeoutExpired:
+        return {"status": "TIMEOUT", "checked_utc": checked, "items": 0, "code": "CLI_TIMEOUT"}
+    except FileNotFoundError:
+        return {"status": "UNAVAILABLE", "checked_utc": checked, "items": 0, "code": "CLI_NOT_INSTALLED"}
+    try:
+        data = json.loads(proc.stdout[:65_536])
+    except (ValueError, TypeError):
+        return {"status": "UNAVAILABLE", "checked_utc": checked, "items": 0, "code": "INVALID_CLI_JSON"}
+    error = data.get("error") if isinstance(data, dict) else None
+    code = str(error.get("code", ""))[:55] if isinstance(error, dict) else "CLI_EXIT_" + str(proc.returncode)
+    hits = data.get("items") if isinstance(data, dict) else None
+    count = len(hits) if isinstance(hits, list) else 0
+    if proc.returncode == 0 and data.get("ok") is True and count > 0:
+        return {"status": "OK", "checked_utc": checked, "items": count, "code": "PUBLIC_READ_VERIFIED"}
+    if code in {"RATE_LIMITED", "PLATFORM_BLOCKED", "NEED_LOGIN", "BUSY"}:
+        return {"status": "BLOCKED", "checked_utc": checked, "items": 0, "code": code}
+    return {"status": "UNAVAILABLE", "checked_utc": checked, "items": 0, "code": code or "NO_PUBLIC_ITEMS"}
+
+def get_adapter_status():
+    with sqlite3.connect(DB_PATH) as conn:
+        row = conn.execute("SELECT value FROM meta WHERE key='agent_reach_result'").fetchone()
+    try:
+        agent = json.loads(row[0]) if row else None
+    except (ValueError, TypeError):
+        agent = None
+    return {"ok": True, "agent_reach": agent or {"status": "NOT_TESTED", "items": 0},
+            "scrapegraphai": {"status": "MODEL_READY" if ollama_ready() else "NO_LOCAL_MODEL"},
+            "checked_utc": timestamp()}
+
+def ollama_ready():
+    if os.getenv("ENABLE_LOCAL_SCRAPEGRAPHAI", "false").lower() != "true":
+        return False
+    base = os.getenv("OLLAMA_BASE_URL", "")
+    model = os.getenv("OLLAMA_MODEL", "")
+    if base not in ("http://127.0.0.1:11434", "http://localhost:11434") or not model:
+        return False
+    try:
+        with OPENER.open(Request(base + "/api/tags", headers={"Accept": "application/json"}), timeout=1.5) as response:
+            if response.status != 200: return False
+            payload = json.loads(response.read(65536))
+        return any(x.get("name") == model or x.get("model") == model for x in payload.get("models", []) if isinstance(x, dict))
+    except Exception:
+        return False
 
 def init_db():
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -222,15 +263,7 @@ def collect(max_sources):
                 scans.append({"source": url[:300], "status": code, "new": new})
             cursor = (cursor + batch) % len(PAGES)
             conn.execute("INSERT INTO meta(key,value) VALUES('cursor',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",(str(cursor),))
-            if os.getenv("ENABLE_AGENT_REACH_PUBLIC", "false").lower() == "true":
-                last = conn.execute("SELECT value FROM meta WHERE key='agent_reach_checked'").fetchone()
-                if not last or time.time() - float(last[0]) > 86400:
-                    try:
-                        outcome = agent_reach_discovery()
-                    except Exception:
-                        outcome = "UNAVAILABLE"
-                    conn.execute("INSERT INTO meta(key,value) VALUES('agent_reach_checked',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",(str(time.time()),))
-                    conn.execute("INSERT INTO meta(key,value) VALUES('agent_reach_result',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",(outcome,))
+            # Agent Reach runs only via explicit authenticated probe, never inside collection.
             return {"ok": True, "items": items, "scans": scans, "state": {"sources": len(PAGES), "cursor": cursor}}
 
 def installed(module):
@@ -246,8 +279,17 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Cache-Control", "no-store")
         self.send_header("Content-Length", str(len(raw)))
         self.end_headers()
-        self.wfile.write(raw)
+        try:
+            self.wfile.write(raw)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
     def do_GET(self):
+        if self.path == "/v1/agent-status":
+            expected = os.getenv("CAREEROPS_BRIDGE_TOKEN", "")
+            supplied = self.headers.get("X-CareerOps-Token", "")
+            if len(expected) < 32 or not hmac.compare_digest(expected, supplied):
+                return self.json(403, {"ok": False, "error": "unauthorized"})
+            return self.json(200, get_adapter_status())
         if self.path != "/healthz":
             return self.json(404, {"ok": False})
         return self.json(200, {
@@ -255,18 +297,29 @@ class Handler(BaseHTTPRequestHandler):
             "scrapling_installed": installed("scrapling"),
             "scrapegraphai_installed": installed("scrapegraphai"),
             "agent_reach_installed": shutil.which("agent-reach") is not None,
-            "ollama_enabled": os.getenv("ENABLE_LOCAL_SCRAPEGRAPHAI", "false").lower() == "true"
-                and os.getenv("OLLAMA_BASE_URL", "") in ("http://127.0.0.1:11434","http://localhost:11434")
-                and bool(os.getenv("OLLAMA_MODEL")),
+            "ollama_enabled": ollama_ready(),
             "gmail_write_capable": False, "sheet_write_capable": False, "schedule_created": False
         })
     def do_POST(self):
-        if self.path != "/v1/collect":
+        if self.path not in ("/v1/collect", "/v1/agent-probe"):
             return self.json(404, {"ok": False})
         expected = os.getenv("CAREEROPS_BRIDGE_TOKEN", "")
         supplied = self.headers.get("X-CareerOps-Token", "")
         if len(expected) < 32 or not hmac.compare_digest(expected, supplied):
             return self.json(403, {"ok": False, "error": "unauthorized"})
+        if self.path == "/v1/agent-probe":
+            if os.getenv("ENABLE_AGENT_REACH_PUBLIC", "false").lower() != "true":
+                return self.json(409, {"ok": False, "error": "disabled"})
+            with LOCK:
+                with sqlite3.connect(DB_PATH) as conn:
+                    previous = conn.execute("SELECT value FROM meta WHERE key='agent_reach_checked'").fetchone()
+                    if previous and time.time() - float(previous[0]) < 300:
+                        return self.json(200, get_adapter_status())
+                result = agent_reach_discovery()
+                with sqlite3.connect(DB_PATH) as conn:
+                    conn.execute("INSERT INTO meta(key,value) VALUES('agent_reach_checked',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (str(time.time()),))
+                    conn.execute("INSERT INTO meta(key,value) VALUES('agent_reach_result',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (json.dumps(result),))
+            return self.json(200, get_adapter_status())
         try:
             length = int(self.headers.get("Content-Length", "0"))
             if length < 0 or length > 2048:
