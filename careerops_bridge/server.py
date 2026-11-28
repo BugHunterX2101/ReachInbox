@@ -38,6 +38,7 @@ PAGES = [
     ("Tecell", "https://careers.tecell.in/jobs/01a1ff0a-21e8-7e75-bb78-e17358385b66"),
     ("Guruvai Sciences", "https://guruvaisciences.org/career/internship-opportunity-build-the-future-of-ai-with-guruvai-sciences"),
     ("HyperBlox", "https://hyperblox.in/careers/"),
+    ("KartAI", "https://kartai.app/careers/nextjs-developer-intern/"),
 ]
 # Start with distinct documented providers rather than two boards on the
 # same failing host. Retain all reviewed sources and the Europe/Canada priority.
@@ -46,7 +47,7 @@ _base_inventory = reviewed_inventory(PAGES)
 # Ashby /robots.txt returned 401; Lever declared pacing requiring review.
 # Do not attempt alternate endpoints or bypass either restriction.
 REVIEW_REQUIRED_HOSTS = frozenset({"api.ashbyhq.com", "api.lever.co"})
-_preferred = ("Quadrature Capital","ATOCONN","Isomorphic Labs")
+_preferred = ("Quadrature Capital","KartAI","ATOCONN","Isomorphic Labs")
 SOURCE_INVENTORY = tuple(s for name in _preferred for s in _base_inventory if s[0]==name) + tuple(s for s in _base_inventory if s[0] not in _preferred and s[0]!="Ubisar")
 DB_PATH = Path(os.environ.get("CAREEROPS_DB", "/tmp/careerops.sqlite"))
 LOCK = threading.RLock()
@@ -195,6 +196,22 @@ def parse_jobposting(html, source_url, company):
                 address = place.get("address")
                 if isinstance(address, dict):
                     pieces.append(", ".join(str(address[k]) for k in ("addressLocality", "addressRegion", "addressCountry") if address.get(k)))
+            # Schema.org remote postings may publish the permitted applicant
+            # country rather than a physical jobLocation. Require an explicit
+            # TELECOMMUTE type and one unambiguous Country. Never infer from HQ,
+            # the URL, a footer, or generic remote text.
+            if not pieces and str(item.get("jobLocationType", "")).upper() == "TELECOMMUTE":
+                requirements = item.get("applicantLocationRequirements")
+                requirements = requirements if isinstance(requirements, list) else [requirements]
+                countries = []
+                for country in requirements:
+                    if not isinstance(country, dict) or country.get("@type") != "Country":
+                        continue
+                    name = country.get("name")
+                    if isinstance(name, str) and name.strip():
+                        countries.append(safe_text(name, 160))
+                if len(requirements) == 1 and len(countries) == 1 and countries[0]:
+                    pieces.append("Remote, " + countries[0])
             seen.add(url)
             out.append({"url": url, "company": company, "title": title,
                         "location": safe_text(", ".join(pieces), 200),
