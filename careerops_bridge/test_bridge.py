@@ -357,6 +357,33 @@ class ReviewedEmployerSourceTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             server.collect(3)
 
+class RemoteLocationCollectionTests(unittest.TestCase):
+    def test_explicit_remote_country_and_reviewed_inventory(self):
+        url="https://kartai.app/careers/nextjs-developer-intern/"
+        item={"@type":"JobPosting","title":"Next.js Developer Intern","url":url,
+              "description":"Current students welcome; internship",
+              "jobLocationType":"TELECOMMUTE",
+              "applicantLocationRequirements":{"@type":"Country","name":"India"}}
+        def parse(data):
+            return server.detail_evidence('<script type="application/ld+json">'+json.dumps(data)+'</script>',url,"KartAI")
+        rows=parse(item)
+        self.assertEqual(len(rows),1)
+        self.assertEqual(rows[0]["location"],"Remote, India")
+        self.assertEqual(rows[0]["extraction"],"scrapling:jsonld")
+        self.assertTrue(server.eligible_hint(rows[0]))
+        self.assertIn(("KartAI","HTML","",url),server.SOURCE_INVENTORY)
+        for bad in (
+            {**item,"jobLocationType":"ON_SITE"},
+            {**item,"applicantLocationRequirements":None},
+            {**item,"applicantLocationRequirements":{"name":"India"}},
+            {**item,"applicantLocationRequirements":[{"@type":"Country","name":"India"},{"@type":"Country","name":"Canada"}]},
+        ):
+            rows=parse(bad)
+            self.assertEqual(rows[0]["location"],"")
+            self.assertFalse(server.eligible_hint(rows[0]))
+        self.assertFalse(parse({**item,"url":"https://kartai.app/careers/other/"}))
+
+
 
 if __name__ == "__main__":
     unittest.main()
